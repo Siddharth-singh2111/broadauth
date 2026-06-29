@@ -15,6 +15,8 @@ manuscript source.
 | F4 | `Q_cap` is a named constant; fixed the `//100` comment | `rcd.go` `ingestQueueCap` | ✅ done |
 | F6 | EWMA latency so `B_i` can recover | `rcd.go` `observeBroadcastLatency` | ✅ done |
 | F12 | Disclosure-queue overflow counter + `[DISCLOSURE-OVERFLOW]` log | `rcd.go` `Metrics.DisclosureDrops` | ✅ done |
+| F8 | Split traffic generation and slot control into independent goroutines | `rcd.go` `trafficLoop`/`slotLoop` | ✅ done |
+| F8.5 | Fix double slot-counter advance: `AdaptiveSlotSource.Ticker()` was called twice, so slot advanced at 2×T_i rate (halving effective disclosure delay). `disclosureWorker` now polls `GetSlot()`. | `rcd.go` `disclosureWorker` | ✅ done |
 | F5 | `storeAdaptiveKey` signature notation | paper Eq. 1 | ⬜ paper |
 | F20 | Fig. 6 shows 7 of 11 loss levels | paper figure | ⬜ paper |
 | F22 | Theorem 1 bound direction (`T_min`, not `T_max`) | paper §V-A | ⬜ paper/theory |
@@ -68,9 +70,9 @@ manuscript source.
 
 ## Remaining code work (not yet done)
 
-- **F7** feedback sign · **F8** decouple traffic/slot loop · **F9** receiver reads
-  `getAdaptiveKey` and enforces a real-time bound · **F10** on-chain tamper check
-  · **F11** sender reads bounds from contract · **F13** control-law refinement.
+- **F7** feedback sign · **F9** receiver reads `getAdaptiveKey` and enforces a
+  real-time bound · **F10** on-chain tamper check · **F11** sender reads bounds
+  from contract · **F13** control-law refinement.
 - **F16** two independent nodes · **F18** static-vs-adaptive comparison · **F21**
   variance/CIs · **F24** adversary model.
 - **F14** sparse feedback channel · **F15** realistic radio model · **F17**

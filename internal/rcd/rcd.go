@@ -230,16 +230,22 @@ func (r *RCD) Start() error {
 
 	r.startTime = time.Now()
 
+	// F8: traffic generation and slot control run in separate goroutines.
+	// The throttled broadcaster blocks for ~len(msg)/50 seconds per send (see
+	// internal/broadcast/udp_broadcast.go), so leaving them in the same select
+	// stalls slot ticks, congestion sampling, and batch flushes behind every
+	// traffic broadcast. Splitting them lets the controller sample state and
+	// emit batches on schedule regardless of radio backpressure.
 	if r.enableBenchmarking {
-		// log.SetOutput(io.Discard)
-		r.wg.Add(4)
+		r.wg.Add(5)
 		go r.benchmarkWorker()
 	} else {
 		log.SetOutput(os.Stderr)
-		r.wg.Add(3)
+		r.wg.Add(4)
 	}
 
-	go r.broadcastLoop()
+	go r.trafficLoop()
+	go r.slotLoop()
 	go r.disclosureWorker()
 	go r.cleanupWorker()
 
@@ -385,22 +391,40 @@ func (r *RCD) requestHashChainOnce(currentSlot uint64) error {
 	return nil
 }
 
-func (r *RCD) broadcastLoop() {
+// trafficLoop generates synthetic application traffic at a fixed cadence and
+// hands each message to r.broadcast(). It may block on the throttled radio,
+// but that no longer interferes with slot scheduling — slotLoop runs in its
+// own goroutine (F8).
+func (r *RCD) trafficLoop() {
 	defer r.wg.Done()
 	trafficTicker := time.NewTicker(20 * time.Millisecond)
 	defer trafficTicker.Stop()
-	slotTicker := r.slotSource.Ticker(r.ctx)
 
 	for {
 		select {
 		case <-r.ctx.Done():
 			return
 		case <-trafficTicker.C:
-			msg := fmt.Sprintf("%s: payload_data_%d", r.id, r.messageCounter)
-			r.messageCounter++
+			msg := fmt.Sprintf("%s: payload_data_%d", r.id, atomic.AddUint64(&r.messageCounter, 1))
 			if err := r.broadcast([]byte(msg)); err != nil {
 				log.Printf("Failed to broadcast message: %v", err)
 			}
+		}
+	}
+}
+
+// slotLoop drives slot-boundary work: probabilistic / prob-adaptive batch
+// flushes plus congestion-metric sampling and the adaptive T_i toggle. It is
+// independent of trafficLoop so the slot timer can never be stalled behind a
+// blocked traffic broadcast (F8).
+func (r *RCD) slotLoop() {
+	defer r.wg.Done()
+	slotTicker := r.slotSource.Ticker(r.ctx)
+
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
 		case currentSlot := <-slotTicker:
 			go func(slotToFlush uint64) {
 				switch r.mode {
@@ -413,7 +437,7 @@ func (r *RCD) broadcastLoop() {
 						log.Printf("Failed to flush batch for slot %d: %v", slotToFlush, err)
 					}
 				}
-			}(currentSlot - 1)
+			}(uint64(currentSlot) - 1)
 
 			if r.mode == ModeAdaptive || r.mode == ModeProbAdaptive {
 				// F2/F3: D_i, B_i and the score all come from one place, so the
@@ -423,7 +447,7 @@ func (r *RCD) broadcastLoop() {
 				r.bufferMutex.Lock()
 				nextT := r.selectDuration(score, r.adaptiveT)
 
-				log.Printf("[PROB-ADAPTIVE: METRICS] Slot: %d | D_i (Queue): %.2f | B_i (Latency): %.2f | C_i (Score): %.2f", 
+				log.Printf("[PROB-ADAPTIVE: METRICS] Slot: %d | D_i (Queue): %.2f | B_i (Latency): %.2f | C_i (Score): %.2f",
 					currentSlot, di, bi, score)
 
 				if nextT != r.adaptiveT {
@@ -834,12 +858,24 @@ func (r *RCD) flushAdaptiveBatch(slot uint64) error {
 
 func (r *RCD) disclosureWorker() {
 	defer r.wg.Done()
-	ticker := r.slotSource.Ticker(r.ctx)
+	// F8 / slot-source hygiene: poll GetSlot() instead of spawning a second
+	// Ticker. AdaptiveSlotSource.Ticker() owns the slot-advance goroutine, so
+	// every extra Ticker() call advances currentSlot at an additional 1/T rate
+	// — effectively halving disclosureDelay's wall-time and forcing legitimate
+	// packets past the security cutoff. Polling decouples this worker's
+	// wakeups from slot advancement.
+	pollTicker := time.NewTicker(100 * time.Millisecond)
+	defer pollTicker.Stop()
 	pendingDisclosures := make([]DisclosurePayload, 0)
 
 	for {
 		select {
-		case currentSlot := <-ticker:
+		case <-pollTicker.C:
+			cs, err := r.slotSource.GetSlot()
+			if err != nil {
+				continue
+			}
+			currentSlot := uint64(cs)
 			for {
 				select {
 				case disclosure := <-r.disclosureMessages:
@@ -871,8 +907,10 @@ func (r *RCD) disclosureWorker() {
 
 					startBroadcast := time.Now()
 					err := r.broadcaster.Broadcast(r.ctx, data)
+					elapsed := time.Since(startBroadcast)
+					r.observeBroadcastLatency(elapsed) // F6
 					if r.enableBenchmarking {
-						atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(startBroadcast).Nanoseconds())
+						atomic.AddInt64(&r.metrics.BroadcastDuration, elapsed.Nanoseconds())
 						atomic.AddInt64(&r.metrics.BroadcastCount, 1)
 					}
 
