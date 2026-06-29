@@ -25,7 +25,19 @@ OWNER_PORT = "10102"
 OWNER_PRIV_KEY = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 CM_ADDR = "0.0.0.0:10101"
 HASHCHAIN_LEN = "1024"
-DISCLOSURE_DELAY = "2"
+# F2 / Fix 2: raised from "2" to "10".
+# Rationale: the throttled UDP broadcaster (internal/broadcast/udp_broadcast.go)
+# takes ~len(msg)/50 seconds per send, ~2 s for a 100-byte data message — and
+# that's before HMAC and key-disclosure broadcasts contend for the same mutex.
+# Wall-time per data-message round-trip is ~9 s in practice. With
+# disclosureDelay=2 (i.e. cutoff = 2 × T_min = 2 s), every data message arrives
+# past its security cutoff and is dropped as 'arrived too late', so every
+# batch verification authenticates zero messages — even at 0% loss.
+# Setting the cutoff to 10 s (10 × T_min) gives the broadcaster enough headroom
+# to actually deliver data messages before the receiver rejects them. Long-term,
+# the fix belongs in the radio model (F15) or in capturing sched.Index at send
+# time rather than generation time (Option A broadcast queue).
+DISCLOSURE_DELAY = "10"
 
 # Regex Parsers
 RE_DI = re.compile(r"D_i \(Queue\): ([\d\.]+)")
@@ -33,7 +45,14 @@ RE_BI = re.compile(r"B_i \(Latency\): ([\d\.]+)")
 RE_TOGGLE = re.compile(r"Scaling T_i: \d+ms -> (\d+)ms")
 RE_BATCH = re.compile(r"Batch of (\d+) packets")
 RE_DROP = re.compile(r"\[SECURITY\] Dropped")
-RE_SUCCESS = re.compile(r"\[SUCCESS\] Prob-Adaptive Batch Verification")
+# Fix 1: parse the actual N from "N messages authenticated" instead of
+# counting verification *events*. The previous "verified_batches" counter
+# would tick on every BF unpack even when 0 messages matched (every batch was
+# in fact authenticating zero, masking a broken pipeline behind a "[SUCCESS]"
+# log line). We now sum N across SUCCESS lines, and count BATCH-EMPTY events
+# separately so empty batches stay visible.
+RE_AUTHED = re.compile(r"Prob-Adaptive Batch Verification: (\d+) messages authenticated")
+RE_BATCH_EMPTY = re.compile(r"\[BATCH-EMPTY\] Prob-Adaptive Batch Verification")
 
 # --- macOS network shaping (dnctl + pfctl / dummynet) ---
 # Linux `tc`/`netem` does not exist on macOS. We emulate packet loss with
@@ -168,7 +187,8 @@ def parse_sweep_log(filepath: str) -> Dict:
     bi_history = []
     batch_sizes = []
     drops = 0
-    successes = 0
+    authenticated = 0  # total messages authenticated (sum of N across SUCCESS lines)
+    empty_batches = 0  # BF unpacked but matched no buffered messages
 
     with open(filepath, "r") as f:
         for line in f:
@@ -191,8 +211,13 @@ def parse_sweep_log(filepath: str) -> Dict:
 
             if RE_DROP.search(line):
                 drops += 1
-            if RE_SUCCESS.search(line):
-                successes += 1
+
+            authed_match = RE_AUTHED.search(line)
+            if authed_match:
+                authenticated += int(authed_match.group(1))
+
+            if RE_BATCH_EMPTY.search(line):
+                empty_batches += 1
 
     return {
         "avg_t_ms": sum(t_history) / len(t_history) if t_history else 1000,
@@ -200,7 +225,11 @@ def parse_sweep_log(filepath: str) -> Dict:
         "peak_bi": max(bi_history) if bi_history else 0.0,
         "avg_batch_size": sum(batch_sizes) / len(batch_sizes) if batch_sizes else 0,
         "security_drops": drops,
-        "verified_batches": successes,
+        # NOTE: the JSON key stays "verified_batches" for chart-script
+        # compatibility, but it now holds the total *authenticated messages*,
+        # not verification events. See Fix 1.
+        "verified_batches": authenticated,
+        "empty_batches": empty_batches,
     }
 
 
@@ -237,6 +266,7 @@ def main():
                 "avg_batch_size": [],
                 "security_drops": [],
                 "verified_batches": [],
+                "empty_batches": [],
             }
 
             for run in range(ITERATIONS):

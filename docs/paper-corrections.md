@@ -17,6 +17,8 @@ manuscript source.
 | F12 | Disclosure-queue overflow counter + `[DISCLOSURE-OVERFLOW]` log | `rcd.go` `Metrics.DisclosureDrops` | ✅ done |
 | F8 | Split traffic generation and slot control into independent goroutines | `rcd.go` `trafficLoop`/`slotLoop` | ✅ done |
 | F8.5 | Fix double slot-counter advance: `AdaptiveSlotSource.Ticker()` was called twice, so slot advanced at 2×T_i rate (halving effective disclosure delay). `disclosureWorker` now polls `GetSlot()`. | `rcd.go` `disclosureWorker` | ✅ done |
+| Fix 1 | Honest verification logging: `[SUCCESS]` only when N>0, `[BATCH-EMPTY]` otherwise. Python parser sums actual N from `N messages authenticated`, separate `empty_batches` counter. Previously every empty BF unpack counted as a "verified batch" — masking that 0 messages had ever actually been authenticated. | `rcd.go`, `sweep_benchmark.py` | ✅ done |
+| Fix 2 | Raise sweep `DISCLOSURE_DELAY` from 2 to 10. Cutoff = delay × T_min was 2s while broadcaster latency is ~2s+ per send, so every data message arrived past its security cutoff and was dropped. Long-term fix is F15 or capturing sched.Index at send time, but the test-config bump lets the existing architecture authenticate at all. | `sweep_benchmark.py` | ✅ done |
 | F5 | `storeAdaptiveKey` signature notation | paper Eq. 1 | ⬜ paper |
 | F20 | Fig. 6 shows 7 of 11 loss levels | paper figure | ⬜ paper |
 | F22 | Theorem 1 bound direction (`T_min`, not `T_max`) | paper §V-A | ⬜ paper/theory |

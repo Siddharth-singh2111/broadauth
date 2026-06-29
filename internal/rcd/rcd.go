@@ -1047,7 +1047,11 @@ func (r *RCD) handleMessage(data []byte) {
 						verifiedCount++
 					}
 				}
-				log.Printf("Probabilistic Batch Verification: %d messages authenticated for slot %d", verifiedCount, targetSlot)
+				if verifiedCount > 0 {
+					log.Printf("[SUCCESS] Probabilistic Batch Verification: %d messages authenticated for slot %d", verifiedCount, targetSlot)
+				} else {
+					log.Printf("[BATCH-EMPTY] Probabilistic Batch Verification: 0 messages authenticated for slot %d (Bloom filter matched none of the buffered messages — likely all data msgs arrived past security cutoff)", targetSlot)
+				}
 				r.unverifiedMsgs.Delete(targetSlot)
 			}
 		case ModeAdaptive:
@@ -1081,8 +1085,12 @@ func (r *RCD) handleMessage(data []byte) {
 						verifiedCount++
 					}
 				}
-				log.Printf("[SUCCESS] Prob-Adaptive Batch Verification: %d messages authenticated for slot %d (T_i: %dms)", verifiedCount, targetSlot, sched.Duration)
-				
+				if verifiedCount > 0 {
+					log.Printf("[SUCCESS] Prob-Adaptive Batch Verification: %d messages authenticated for slot %d (T_i: %dms)", verifiedCount, targetSlot, sched.Duration)
+				} else {
+					log.Printf("[BATCH-EMPTY] Prob-Adaptive Batch Verification: 0 messages authenticated for slot %d (T_i: %dms) — Bloom filter unpacked OK, but no buffered messages matched (likely dropped as 'arrived too late')", targetSlot, sched.Duration)
+				}
+
 				// Cleanup the window
 				r.unverifiedMsgs.Delete(targetSlot - 1)
 				r.unverifiedMsgs.Delete(targetSlot)
