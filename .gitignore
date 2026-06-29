@@ -8,4 +8,5 @@
 /venv/
 /papers/
 /benchmarks/
+**/__pycache__/
 pyrightconfig.json

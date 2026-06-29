@@ -10,9 +10,9 @@ from typing import List, Dict
 # --- CONFIGURATION ---
 SWEEP_DIR = "benchmarks/sweep"
 RESULTS_FILE = f"{SWEEP_DIR}/sweep_results.json"
-DURATION = 120 
-LOSS_RATES = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100] 
-ITERATIONS = 10 
+DURATION = 100
+LOSS_RATES = [0, 20, 40, 60]
+ITERATIONS = 1
 
 # Binaries & Shared Arguments
 RCD_BIN = "./bin/rcd"
@@ -35,11 +35,40 @@ RE_BATCH = re.compile(r"Batch of (\d+) packets")
 RE_DROP = re.compile(r"\[SECURITY\] Dropped")
 RE_SUCCESS = re.compile(r"\[SUCCESS\] Prob-Adaptive Batch Verification")
 
+# --- macOS network shaping (dnctl + pfctl / dummynet) ---
+# Linux `tc`/`netem` does not exist on macOS. We emulate packet loss with
+# dummynet pipes attached via pf. The broadcast-auth data plane is UDP on
+# port 8888 (see internal/broadcast/udp_broadcast.go); we shape only that so
+# the eth RPC (8545) and cm/owner control channels stay untouched.
+DNCTL = "/usr/sbin/dnctl"
+PFCTL = "/sbin/pfctl"
+DN_PIPE = "1"
+UDP_PORT = "8888"
+
+
+def _run(cmd: str, check: bool = False, inp: str | None = None):
+    return subprocess.run(
+        cmd,
+        shell=True,
+        check=check,
+        input=inp,
+        text=True if inp is not None else None,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def reset_network():
+    """Remove any dummynet/pf shaping we installed and restore defaults."""
+    _run(f"{DNCTL} -q flush")
+    _run(f"{PFCTL} -f /etc/pf.conf")
+    _run(f"{PFCTL} -d")
+
 
 def setup_directories():
     if not os.path.exists(SWEEP_DIR):
         os.makedirs(SWEEP_DIR)
-    subprocess.run("tc qdisc del dev lo root", shell=True, stderr=subprocess.DEVNULL)
+    reset_network()
 
 
 def start_owner() -> subprocess.Popen[str]:
@@ -113,20 +142,20 @@ def get_uuids_from_owner(owner_proc: subprocess.Popen[str], count: int) -> List[
 
 
 def apply_network_chaos(loss: int):
-    subprocess.run("tc qdisc del dev lo root", shell=True, stderr=subprocess.DEVNULL)
+    reset_network()
     if loss > 0:
-        subprocess.run(
-            "tc qdisc add dev lo root handle 1: prio", shell=True, check=True
+        frac = loss / 100.0
+        # Configure a dummynet pipe with the desired packet-loss rate.
+        _run(f"{DNCTL} pipe {DN_PIPE} config plr {frac}", check=True)
+        # Route only UDP/8888 (in & out, any interface) through the pipe.
+        rules = (
+            f"dummynet in quick proto udp from any to any port {UDP_PORT} pipe {DN_PIPE}\n"
+            f"dummynet out quick proto udp from any to any port {UDP_PORT} pipe {DN_PIPE}\n"
         )
-        tc_cmd = f"tc qdisc add dev lo parent 1:1 handle 10: netem drop {loss}%"
-        subprocess.run(tc_cmd, shell=True, check=True)
-        subprocess.run(
-            "tc filter add dev lo protocol ip parent 1:0 u32 match ip protocol 17 0xff flowid 1:1",
-            shell=True,
-            check=True,
-        )
+        _run(f"{PFCTL} -f -", check=True, inp=rules)
+        _run(f"{PFCTL} -e")
         print(
-            f"    [+] Applied Selective UDP Throttle: Pure {loss}% packet drop pipeline"
+            f"    [+] Applied Selective UDP Throttle: Pure {loss}% packet drop on port {UDP_PORT} (dummynet)"
         )
     else:
         print("    [+] Network is clean (0% drop)")
@@ -215,9 +244,7 @@ def main():
                 uuid_index += 1
 
                 print(f"  [*] Trial {run + 1}/{ITERATIONS} (UUID: {uid})")
-                subprocess.run(
-                    "tc qdisc del dev lo root", shell=True, stderr=subprocess.DEVNULL
-                )
+                reset_network()
 
                 log_file = f"{SWEEP_DIR}/probadaptive_loss_{loss}_run_{run + 1}.log"
 
@@ -288,9 +315,7 @@ def main():
                 f"  -> Avg Prevented Forgeries: {averaged_metrics['security_drops']:.1f}"
             )
 
-        subprocess.run(
-            "tc qdisc del dev lo root", shell=True, stderr=subprocess.DEVNULL
-        )
+        reset_network()
         print("\n[*] Network restored to normal.")
 
         with open(RESULTS_FILE, "w") as f:
@@ -304,9 +329,7 @@ def main():
             owner_proc.wait(timeout=2)
         except:
             owner_proc.kill()
-        subprocess.run(
-            "tc qdisc del dev lo root", shell=True, stderr=subprocess.DEVNULL
-        )
+        reset_network()
 
 
 if __name__ == "__main__":
