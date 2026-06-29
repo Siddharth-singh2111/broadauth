@@ -38,6 +38,36 @@ const (
 	ModeProbAdaptive
 )
 
+const (
+	// --- Congestion controller tuning (Prob-Adaptive Inf-TESLA++, §IV) ---
+
+	// ingestQueueCap is Q_cap in D_i = Q_len / Q_cap. Q_len is the ingest
+	// (pre-flush) backlog of unauthenticated packets — the place where genuine
+	// backpressure accumulates when the radio/disclosure pipeline cannot keep
+	// up. (F4: this replaces the old magic 10.0 whose comment wrongly said 100.
+	// The real per-device value should be calibrated; see the tuner, F25.)
+	ingestQueueCap = 10.0
+
+	// latencyBaselineMs is L_base in B_i = min(1, L_avg / L_base). Single source
+	// of truth — matches the paper's 20 ms (F3 removes the divergent 50 ms path).
+	latencyBaselineMs = 20.0
+
+	// Queue-dominant weighting (W_disc + W_lat = 1), matching paper Eq. 4 (F1):
+	// unauthenticated-key loss is unrecoverable, broadcast latency is recoverable
+	// via receiver buffering.
+	wDisc = 0.70
+	wLat  = 0.30
+
+	// Multiplicative time-scaling thresholds on the Congestion Score C_i.
+	scaleUpThreshold   = 0.75
+	scaleDownThreshold = 0.25
+
+	// latencyEWMAAlpha weights the most recent broadcast-latency sample so B_i
+	// can decay when pressure subsides. A cumulative mean cannot decay and pins
+	// B_i high for the rest of the run (F6).
+	latencyEWMAAlpha = 0.2
+)
+
 // Metrics holds atomic counters for benchmarking
 type Metrics struct {
 	BytesSent        uint64
@@ -45,6 +75,7 @@ type Metrics struct {
 	MessagesSent     uint64
 	MessagesReceived uint64
 	OverheadBytes    uint64 // Bytes used for HMACs, Keys, BloomFilters (non-payload)
+	DisclosureDrops  uint64 // F12: disclosure-queue overflow events (keys never disclosed)
 
 	// Timing Metrics (Cumulative Nanoseconds)
 	HMACDuration      int64
@@ -95,6 +126,11 @@ type RCD struct {
 	adaptiveOffset uint64
 	tMin           uint64
 	tMax           uint64
+
+	// F6: recency-weighted broadcast-latency tracker (ms) feeding B_i.
+	latencyEWMAms   float64
+	latencyEWMAInit bool
+	latencyMu       sync.Mutex
 
 	metrics Metrics
 }
@@ -380,20 +416,9 @@ func (r *RCD) broadcastLoop() {
 			}(currentSlot - 1)
 
 			if r.mode == ModeAdaptive || r.mode == ModeProbAdaptive {
-				di := float64(len(r.messageBuffer)) / 10.0 // Assuming 100 is the channel capacity
-				
-				var avgLatNs float64
-				count := atomic.LoadInt64(&r.metrics.BroadcastCount)
-				dur := atomic.LoadInt64(&r.metrics.BroadcastDuration)
-				if count > 0 {
-					avgLatNs = float64(dur) / float64(count)
-				}
-				// bi := (avgLatNs / 1e6) / 20.0 // 20ms baseline
-				// Higher baseline for RCDs
-				bi := (avgLatNs / 1e6) / 50.0 // 50ms baseline
-				if bi > 1.0 { bi = 1.0 }
-
-				score := r.calculateTimeCongestion()
+				// F2/F3: D_i, B_i and the score all come from one place, so the
+				// logged metrics are exactly what the controller acts on.
+				di, bi, score := r.calculateTimeCongestion()
 
 				r.bufferMutex.Lock()
 				nextT := r.selectDuration(score, r.adaptiveT)
@@ -496,8 +521,10 @@ func (r *RCD) broadcast(data []byte) error {
 
 	start := time.Now()
 	err = r.broadcaster.Broadcast(r.ctx, msgBytes)
+	elapsed := time.Since(start)
+	r.observeBroadcastLatency(elapsed) // F6: live recency-weighted latency signal
 	if r.enableBenchmarking {
-		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(start).Nanoseconds())
+		atomic.AddInt64(&r.metrics.BroadcastDuration, elapsed.Nanoseconds())
 		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
 	}
 
@@ -564,6 +591,8 @@ func (r *RCD) broadcastDeterministic(data []byte, key []byte, currentSlot uint64
 		TargetSlot: targetSlot,
 	}:
 	default:
+		atomic.AddUint64(&r.metrics.DisclosureDrops, 1)
+		log.Printf("[DISCLOSURE-OVERFLOW] Disclosure queue full; key for this slot will never be broadcast")
 		return fmt.Errorf("disclosure queue full")
 	}
 	return nil
@@ -628,6 +657,8 @@ func (r *RCD) broadcastAdaptive(packedData []byte, key []byte, currentSlot uint6
 		TargetSlot: targetSlot,
 	}:
 	default:
+		atomic.AddUint64(&r.metrics.DisclosureDrops, 1)
+		log.Printf("[DISCLOSURE-OVERFLOW] Disclosure queue full; key for this slot will never be broadcast")
 		return fmt.Errorf("disclosure queue full")
 	}
 	return nil
@@ -698,6 +729,8 @@ func (r *RCD) flushBatch(slot uint64) error {
 		TargetSlot: targetSlot,
 	}:
 	default:
+		atomic.AddUint64(&r.metrics.DisclosureDrops, 1)
+		log.Printf("[DISCLOSURE-OVERFLOW] Disclosure queue full; key for this slot will never be broadcast")
 		return fmt.Errorf("disclosure queue full")
 	}
 	return nil
@@ -769,6 +802,8 @@ func (r *RCD) flushAdaptiveBatch(slot uint64) error {
 		TargetSlot: targetSlot,
 	}:
 	default:
+		atomic.AddUint64(&r.metrics.DisclosureDrops, 1)
+		log.Printf("[DISCLOSURE-OVERFLOW] Disclosure queue full; key for this slot will never be broadcast")
 		return fmt.Errorf("disclosure queue full")
 	}
 
@@ -779,7 +814,14 @@ func (r *RCD) flushAdaptiveBatch(slot uint64) error {
 		atomic.AddUint64(&r.metrics.OverheadBytes, l)
 	}
 
+	startBcast := time.Now()
 	err = r.broadcaster.Broadcast(r.ctx, hmacBytes)
+	elapsedBcast := time.Since(startBcast)
+	r.observeBroadcastLatency(elapsedBcast) // F6
+	if r.enableBenchmarking {
+		atomic.AddInt64(&r.metrics.BroadcastDuration, elapsedBcast.Nanoseconds())
+		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
+	}
 	if err != nil {
 		log.Printf("[PROB-ADAPTIVE: FLUSH-ERROR] Broadcast failed on slot %d: %v", slot, err)
 		return fmt.Errorf("failed to broadcast adaptive batch HMAC: %v", err)
@@ -1092,45 +1134,64 @@ func (r *RCD) calculateHMAC(key, data []byte) []byte {
 	return h.Sum(nil)
 }
 
-func (r *RCD) calculateTimeCongestion() float64 {
-	// --- THE TRUE QUEUE ---
-	// Because hardware is blocking the flushes, the backpressure 
-	// forces packets to pile up in the ingest buffer!
+// calculateTimeCongestion returns the disclosure-queue pressure D_i, the
+// broadcast-latency penalty B_i, and the combined Congestion Score C_i. All
+// three come from here so the logged metrics are exactly the values the
+// controller acts on (F2/F3).
+//
+// D_i is measured on the ingest (pre-flush) buffer: that is where genuine
+// backpressure accumulates as unauthenticated packets when the radio/disclosure
+// pipeline cannot keep up. NOTE: paper Eq. 2 must describe D_i as this ingest
+// backlog, not "pending disclosure events" (see docs/paper-corrections.md).
+//
+// B_i uses the recency-weighted (EWMA) latency so the signal can recover when
+// pressure subsides; a cumulative mean cannot decay and would pin B_i high (F6).
+func (r *RCD) calculateTimeCongestion() (di float64, bi float64, score float64) {
 	r.bufferMutex.Lock()
-	queueLen := float64(len(r.messageBuffer))
+	backlog := float64(len(r.messageBuffer))
 	r.bufferMutex.Unlock()
-	
-	// A backlog of 10 packets means the memory is 100% strained.
-	queueCap := 10.0 
-	disclosureQueue := queueLen / queueCap
-	if disclosureQueue > 1.0 {
-		disclosureQueue = 1.0
+
+	di = backlog / ingestQueueCap
+	if di > 1.0 {
+		di = 1.0
 	}
 
-	var avgLatNs float64
-	count := atomic.LoadInt64(&r.metrics.BroadcastCount)
-	dur := atomic.LoadInt64(&r.metrics.BroadcastDuration)
-	if count > 0 {
-		avgLatNs = float64(dur) / float64(count)
+	bi = r.broadcastLatencyEWMAms() / latencyBaselineMs
+	if bi > 1.0 {
+		bi = 1.0
 	}
 
-	broadcastLatency := (avgLatNs / 1e6) / 20.0 
-	if broadcastLatency > 1.0 {
-		broadcastLatency = 1.0 
+	score = wDisc*di + wLat*bi
+	return di, bi, score
+}
+
+// observeBroadcastLatency feeds the EWMA latency tracker used by the congestion
+// controller. Called on every broadcast regardless of the benchmark flag so the
+// controller always has a live, recency-weighted signal (F6).
+func (r *RCD) observeBroadcastLatency(d time.Duration) {
+	ms := float64(d.Microseconds()) / 1000.0
+	r.latencyMu.Lock()
+	if r.latencyEWMAInit {
+		r.latencyEWMAms = latencyEWMAAlpha*ms + (1-latencyEWMAAlpha)*r.latencyEWMAms
+	} else {
+		r.latencyEWMAms = ms
+		r.latencyEWMAInit = true
 	}
+	r.latencyMu.Unlock()
+}
 
-	wDisc := 0.30
-	wLat := 0.70
-
-	return (wDisc * disclosureQueue) + (wLat * broadcastLatency)
+func (r *RCD) broadcastLatencyEWMAms() float64 {
+	r.latencyMu.Lock()
+	defer r.latencyMu.Unlock()
+	return r.latencyEWMAms
 }
 
 func (r *RCD) selectDuration(score float64, currentT uint64) uint64 {
 	nextT := currentT
 
-	if score > 0.75 {
+	if score > scaleUpThreshold {
 		nextT = currentT * 2
-	} else if score < 0.25 {
+	} else if score < scaleDownThreshold {
 		nextT = currentT / 2
 	}
 
