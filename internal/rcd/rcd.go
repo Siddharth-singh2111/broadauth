@@ -263,6 +263,23 @@ func (r *RCD) Start() error {
 		return fmt.Errorf("failed to start receiver: %v", err)
 	}
 
+	// Pre-fetch the hashchain SYNCHRONOUSLY before launching any worker.
+	// CurrentSlotKey acquires chainMutex AND calls RequestHashChain on a cold
+	// start. The owner's storeAdaptiveKey on-chain transaction takes ~12 s on
+	// anvil (`-block-time 12`), so on the very first call this blocks the
+	// caller for ~12 s. If we let the broadcastWorker make that first call
+	// after Start() returns, the worker holds chainMutex for those 12 s and
+	// every flushAdaptiveBatch goroutine queues behind it — which is exactly
+	// what the previous sweep showed (slot 1's FLUSH-SUCCESS log only fired
+	// 17 s after slot 1 was initiated). By blocking here, the 12 s happens
+	// once, deterministically, before any goroutine that depends on the
+	// chain ever starts. The sweep harness must wait long enough between
+	// rcd_proc.Popen() and applying network shaping to cover this — bumped
+	// to 15 s in sweep_benchmark.py.
+	if _, _, err := r.CurrentSlotKey(); err != nil {
+		return fmt.Errorf("failed to pre-fetch initial hashchain: %v", err)
+	}
+
 	r.startTime = time.Now()
 
 	// F8: traffic generation and slot control run in separate goroutines.

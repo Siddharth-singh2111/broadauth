@@ -25,14 +25,14 @@ OWNER_PORT = "10102"
 OWNER_PRIV_KEY = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 CM_ADDR = "0.0.0.0:10101"
 HASHCHAIN_LEN = "1024"
-# Fix 2 (now superseded by Bug-B fix in rcd.go but kept generous for safety):
-# the throttled UDP broadcaster (internal/broadcast/udp_broadcast.go) takes
-# ~len(msg)/50 seconds per send. With 3 message types contending for the same
-# mutex, real round-trip latency was ~9 s. With the new broadcast worker queue
-# AND sched.Index captured at send time (rcd.go: buildAdaptiveDataAtSendTime),
-# the wall-time-to-receiver is now milliseconds, so a 30-slot cutoff at
-# T_min=1000 ms gives 30 s of headroom — far beyond what should now be needed.
-DISCLOSURE_DELAY = "30"
+DISCLOSURE_DELAY = "2"
+
+# RCD pre-fetches its hashchain synchronously in Start() (see internal/rcd/rcd.go
+# Start). With anvil's `-block-time 12` the owner's storeAdaptiveKey
+# transaction takes up to ~12 s to mine before the chain TCP response returns.
+# Wait long enough to cover that before applying network shaping, otherwise
+# shaping would drop the chain-fetch packets.
+RCD_STARTUP_WAIT = 15
 
 # Regex Parsers
 RE_DI = re.compile(r"D_i \(Queue\): ([\d\.]+)")
@@ -40,20 +40,19 @@ RE_BI = re.compile(r"B_i \(Latency\): ([\d\.]+)")
 RE_TOGGLE = re.compile(r"Scaling T_i: \d+ms -> (\d+)ms")
 RE_BATCH = re.compile(r"Batch of (\d+) packets")
 RE_DROP = re.compile(r"\[SECURITY\] Dropped")
-# Fix 1: parse the actual N from "N messages authenticated" instead of
-# counting verification *events*. The previous "verified_batches" counter
-# would tick on every BF unpack even when 0 messages matched (every batch was
-# in fact authenticating zero, masking a broken pipeline behind a "[SUCCESS]"
-# log line). We now sum N across SUCCESS lines, and count BATCH-EMPTY events
-# separately so empty batches stay visible.
+# Fix 1: count actual authenticated messages (the N in "N messages
+# authenticated"), not verification events. The previous RE_SUCCESS regex
+# ticked on every BF unpack — even when 0 messages matched — and reported a
+# misleading "verified_batches" count. Bug-A fix in rcd.go now emits SUCCESS
+# only when N > 0 and BATCH-EMPTY otherwise; we count both separately.
 RE_AUTHED = re.compile(r"Prob-Adaptive Batch Verification: (\d+) messages authenticated")
 RE_BATCH_EMPTY = re.compile(r"\[BATCH-EMPTY\] Prob-Adaptive Batch Verification")
 
 # --- macOS network shaping (dnctl + pfctl / dummynet) ---
-# Linux `tc`/`netem` does not exist on macOS. We emulate packet loss with
-# dummynet pipes attached via pf. The broadcast-auth data plane is UDP on
-# port 8888 (see internal/broadcast/udp_broadcast.go); we shape only that so
-# the eth RPC (8545) and cm/owner control channels stay untouched.
+# Linux's tc/netem doesn't exist on Darwin. The broadcast-auth data plane is
+# UDP on port 8888 (internal/broadcast/udp_broadcast.go DefaultUDPConfig); we
+# shape only that, leaving eth RPC (8545) and the cm/owner control channels
+# untouched.
 DNCTL = "/usr/sbin/dnctl"
 PFCTL = "/sbin/pfctl"
 DN_PIPE = "1"
@@ -79,10 +78,25 @@ def reset_network():
     _run(f"{PFCTL} -d")
 
 
+def kill_stale_processes():
+    """Kill any leftover RCD / owner processes from a prior interrupted run.
+
+    Without this, a stale RCD keeps broadcasting on UDP/8888 alongside the new
+    sweep's RCD. They receive each other's data and HMACs but can't verify
+    them (different UUID, different hashchain), so the log shows 'two RCDs
+    starting' and authentication never succeeds. Anvil and cm are
+    user-managed — never touch them.
+    """
+    _run("pkill -f 'BroadAuth/bin/rcd'")
+    _run("pkill -f 'BroadAuth/bin/owner'")
+    time.sleep(1)  # let the OS reap them and release UDP/8888
+
+
 def setup_directories():
     if not os.path.exists(SWEEP_DIR):
         os.makedirs(SWEEP_DIR)
     reset_network()
+    kill_stale_processes()
 
 
 def start_owner() -> subprocess.Popen[str]:
@@ -220,9 +234,8 @@ def parse_sweep_log(filepath: str) -> Dict:
         "peak_bi": max(bi_history) if bi_history else 0.0,
         "avg_batch_size": sum(batch_sizes) / len(batch_sizes) if batch_sizes else 0,
         "security_drops": drops,
-        # NOTE: the JSON key stays "verified_batches" for chart-script
-        # compatibility, but it now holds the total *authenticated messages*,
-        # not verification events. See Fix 1.
+        # Key preserved for chart-script compatibility but holds total
+        # authenticated messages now (Fix 1), not unpack events.
         "verified_batches": authenticated,
         "empty_batches": empty_batches,
     }
@@ -301,17 +314,32 @@ def main():
                         stderr=subprocess.STDOUT,
                     )
 
-                    time.sleep(5)  # Let RCD fetch hashchain
+                    # RCD pre-fetches hashchain synchronously in Start();
+                    # anvil block mining takes ~12 s, so wait 15 s before
+                    # applying shaping (so chain-fetch packets aren't
+                    # caught by the dummynet pipe).
+                    time.sleep(RCD_STARTUP_WAIT)
                     apply_network_chaos(loss)
 
                     try:
-                        time.sleep(DURATION - 5)
+                        time.sleep(DURATION - RCD_STARTUP_WAIT)
                     except KeyboardInterrupt:
                         rcd_proc.terminate()
+                        rcd_proc.wait(timeout=5)
                         raise
 
                     rcd_proc.terminate()
-                    rcd_proc.wait()
+                    try:
+                        rcd_proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        rcd_proc.kill()
+                        rcd_proc.wait()
+
+                # Safety: belt-and-braces — confirm the RCD really is gone
+                # before the next iteration starts (otherwise the next run's
+                # RCD shares UDP/8888 with the previous one and the auth
+                # pipeline silently breaks).
+                kill_stale_processes()
 
                 # Parse the individual run
                 metrics = parse_sweep_log(log_file)
@@ -334,10 +362,13 @@ def main():
                 f"  -> Avg Batch Size: {averaged_metrics['avg_batch_size']:.1f} packets"
             )
             print(
-                f"  -> Avg Authenticated Batches: {averaged_metrics['verified_batches']:.1f}"
+                f"  -> Avg Authenticated Messages: {averaged_metrics['verified_batches']:.1f}"
             )
             print(
-                f"  -> Avg Prevented Forgeries: {averaged_metrics['security_drops']:.1f}"
+                f"  -> Avg Empty Batches:           {averaged_metrics['empty_batches']:.1f}"
+            )
+            print(
+                f"  -> Avg Late-Arrival Drops:      {averaged_metrics['security_drops']:.1f}"
             )
 
         reset_network()
@@ -351,10 +382,12 @@ def main():
         print("[*] Stopping Owner Node...")
         owner_proc.terminate()
         try:
-            owner_proc.wait(timeout=2)
-        except:
+            owner_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
             owner_proc.kill()
+            owner_proc.wait()
         reset_network()
+        kill_stale_processes()
 
 
 if __name__ == "__main__":
