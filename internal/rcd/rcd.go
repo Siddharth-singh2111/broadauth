@@ -104,14 +104,15 @@ type RCD struct {
 	receiver    broadcast.Receiver
 	slotSource  slot.SlotSource
 
-	// broadcastQueue feeds a dedicated worker that drains through the
-	// throttled radio. With trafficLoop, slotLoop (flush HMAC), and
-	// disclosureWorker all pushing to the same queue, the worker serializes
-	// onto the broadcaster but the producers never block — which lets
-	// messageBuffer actually accumulate, lets the controller's D_i react to
-	// real load, and lets the worker capture sched.Index at send time
-	// (Bug-B fix).
-	broadcastQueue chan broadcastJob
+	// controlQueue and dataQueue are priority lanes for the broadcast worker
+	// (Bug-X fix). Originally there was a single FIFO `broadcastQueue` that
+	// trafficLoop flooded at 50 Hz; HMACs and key disclosures queued behind
+	// thousands of data msgs and never reached the radio. Two queues + the
+	// worker always preferring controlQueue guarantees that authentication-
+	// critical traffic (HMAC, key disclosure) gets through whenever the radio
+	// has bandwidth. Data msgs only use the spare bandwidth that remains.
+	controlQueue chan broadcastJob
+	dataQueue    chan broadcastJob
 
 	disclosureMessages chan DisclosurePayload
 	receivedHMACs      sync.Map
@@ -158,6 +159,11 @@ type DisclosurePayload struct {
 // captured currentSlot. The latter path is the Bug-B fix: sched.Index now
 // reflects when the packet actually goes on the wire, not when traffic was
 // generated 9+ seconds earlier behind the throttled broadcaster.
+//
+// priority distinguishes control traffic (HMAC, key disclosure) from data
+// traffic. The worker drains controlQueue strictly before dataQueue so
+// authentication-critical messages aren't starved by the high-rate
+// trafficLoop (Bug-X fix).
 type broadcastJob struct {
 	preBuilt []byte
 	rawData  []byte
@@ -234,7 +240,12 @@ func New(cfg Config) (*RCD, error) {
 		receiver:           receiver,
 		slotSource:         slotSource,
 		disclosureMessages: make(chan DisclosurePayload, 1024),
-		broadcastQueue:     make(chan broadcastJob, 4096),
+		// controlQueue holds HMACs and key disclosures (small, bounded number
+		// per slot — generous capacity so nothing important is ever dropped).
+		// dataQueue holds the high-rate trafficLoop output; capacity is large
+		// but bounded, so under sustained overload trafficLoop drops cleanly.
+		controlQueue: make(chan broadcastJob, 1024),
+		dataQueue:    make(chan broadcastJob, 4096),
 		messageBuffer:      make([][]byte, 0),
 		mode:               cfg.Mode,
 		tMin:               cfg.TMin,
@@ -555,8 +566,11 @@ func (r *RCD) broadcast(data []byte) error {
 			atomic.AddUint64(&r.metrics.MessagesSent, 1)
 		}
 
-		// Enqueue raw data; worker will marshal with a fresh slot at send.
-		if err := r.enqueueBroadcast(broadcastJob{rawData: data, mode: r.mode}); err != nil {
+		// Enqueue raw data on the data lane; worker will marshal with a fresh
+		// slot at send (Bug-B) and only transmit after controlQueue is drained
+		// (Bug-X). Dropping a data msg here is expected under sustained
+		// overload — the BF still contains it (already in messageBuffer).
+		if err := r.enqueueDataBroadcast(broadcastJob{rawData: data, mode: r.mode}); err != nil {
 			return err
 		}
 		return nil
@@ -598,7 +612,9 @@ func (r *RCD) broadcast(data []byte) error {
 		atomic.AddUint64(&r.metrics.MessagesSent, 1)
 	}
 
-	if err := r.enqueueBroadcast(broadcastJob{preBuilt: msgBytes}); err != nil {
+	// Deterministic/Adaptive: the per-msg Data message is application data
+	// (data lane). The per-msg HMAC that follows below goes on control.
+	if err := r.enqueueDataBroadcast(broadcastJob{preBuilt: msgBytes}); err != nil {
 		return err
 	}
 
@@ -632,7 +648,7 @@ func (r *RCD) broadcastDeterministic(data []byte, key []byte, currentSlot uint64
 		atomic.AddUint64(&r.metrics.OverheadBytes, l)
 	}
 
-	if err := r.enqueueBroadcast(broadcastJob{preBuilt: hmacData}); err != nil {
+	if err := r.enqueueControlBroadcast(broadcastJob{preBuilt: hmacData}); err != nil {
 		return fmt.Errorf("failed to enqueue HMAC message: %v", err)
 	}
 
@@ -681,7 +697,7 @@ func (r *RCD) broadcastAdaptive(packedData []byte, key []byte, currentSlot uint6
 		atomic.AddUint64(&r.metrics.OverheadBytes, l)
 	}
 
-	if err := r.enqueueBroadcast(broadcastJob{preBuilt: hmacData}); err != nil {
+	if err := r.enqueueControlBroadcast(broadcastJob{preBuilt: hmacData}); err != nil {
 		return fmt.Errorf("failed to enqueue adaptive HMAC message: %v", err)
 	}
 
@@ -746,7 +762,7 @@ func (r *RCD) flushBatch(slot uint64) error {
 		atomic.AddUint64(&r.metrics.OverheadBytes, l)
 	}
 
-	if err := r.enqueueBroadcast(broadcastJob{preBuilt: hmacBytes}); err != nil {
+	if err := r.enqueueControlBroadcast(broadcastJob{preBuilt: hmacBytes}); err != nil {
 		return fmt.Errorf("failed to enqueue batch HMAC message: %v", err)
 	}
 
@@ -848,7 +864,7 @@ func (r *RCD) flushAdaptiveBatch(slot uint64) error {
 		atomic.AddUint64(&r.metrics.OverheadBytes, l)
 	}
 
-	if err := r.enqueueBroadcast(broadcastJob{preBuilt: hmacBytes}); err != nil {
+	if err := r.enqueueControlBroadcast(broadcastJob{preBuilt: hmacBytes}); err != nil {
 		log.Printf("[PROB-ADAPTIVE: FLUSH-ERROR] Enqueue failed on slot %d: %v", slot, err)
 		return fmt.Errorf("failed to enqueue adaptive batch HMAC: %v", err)
 	}
@@ -887,11 +903,18 @@ func (r *RCD) disclosureWorker() {
 				}
 			}
 		ProcessPending:
-			readyIdx := 0
-			for i, disclosure := range pendingDisclosures {
+			// Bug-Y fix: iterate ALL pending disclosures and send the ones
+			// whose TargetSlot has been reached. The previous prefix-based
+			// scan (`break` on first not-ready) silently dropped every
+			// ready disclosure that came *after* a not-ready one in the
+			// slice — which happens routinely because flushAdaptiveBatch
+			// runs in a spawned goroutine per slot and completes out of
+			// order, so pendingDisclosures is NOT sorted by TargetSlot.
+			stillPending := pendingDisclosures[:0]
+			for _, disclosure := range pendingDisclosures {
 				if disclosure.TargetSlot > currentSlot {
-					readyIdx = i
-					break
+					stillPending = append(stillPending, disclosure)
+					continue
 				}
 				disclosureMsg := message.NewMessage(
 					r.id,
@@ -900,26 +923,25 @@ func (r *RCD) disclosureWorker() {
 					append(disclosure.Key[:], disclosure.Message...),
 				)
 				data, err := disclosureMsg.Marshal()
-				if err == nil {
-					if r.enableBenchmarking {
-						l := uint64(len(data))
-						atomic.AddUint64(&r.metrics.BytesSent, l)
-						atomic.AddUint64(&r.metrics.OverheadBytes, l)
-					}
-
-					if err := r.enqueueBroadcast(broadcastJob{preBuilt: data}); err != nil {
-						log.Printf("Failed to enqueue disclosure: %v", err)
-					} else {
-						log.Printf("Sent key disclosure message for slot %d", currentSlot)
-					}
-				} else {
+				if err != nil {
 					log.Printf("Failed to marshal disclosure: %v", err)
+					continue
 				}
-				readyIdx = i + 1
+				if r.enableBenchmarking {
+					l := uint64(len(data))
+					atomic.AddUint64(&r.metrics.BytesSent, l)
+					atomic.AddUint64(&r.metrics.OverheadBytes, l)
+				}
+				if err := r.enqueueControlBroadcast(broadcastJob{preBuilt: data}); err != nil {
+					log.Printf("Failed to enqueue disclosure: %v", err)
+					// Keep this disclosure pending; control queue may have
+					// space on the next tick.
+					stillPending = append(stillPending, disclosure)
+					continue
+				}
+				log.Printf("Sent key disclosure message for slot %d", disclosure.TargetSlot)
 			}
-			if readyIdx > 0 {
-				pendingDisclosures = pendingDisclosures[readyIdx:]
-			}
+			pendingDisclosures = stillPending
 		case <-r.ctx.Done():
 			return
 		}
@@ -1237,12 +1259,13 @@ func (r *RCD) broadcastLatencyEWMAms() float64 {
 	return r.latencyEWMAms
 }
 
-// enqueueBroadcast hands a broadcast job to the worker. Non-blocking: if the
-// queue is full we drop and count it. Producers (trafficLoop, slotLoop,
-// disclosureWorker, deterministic HMAC path) must never block on the radio.
-func (r *RCD) enqueueBroadcast(job broadcastJob) error {
+// enqueueDataBroadcast hands a high-rate data-msg job to the worker via the
+// data lane. Non-blocking: if the data lane is full we drop and count it.
+// trafficLoop is the sole producer here; HMACs/disclosures use the control
+// lane (Bug-X fix).
+func (r *RCD) enqueueDataBroadcast(job broadcastJob) error {
 	select {
-	case r.broadcastQueue <- job:
+	case r.dataQueue <- job:
 		return nil
 	case <-r.ctx.Done():
 		return r.ctx.Err()
@@ -1252,41 +1275,80 @@ func (r *RCD) enqueueBroadcast(job broadcastJob) error {
 	}
 }
 
-// broadcastWorker drains broadcastQueue through the throttled radio. For
-// adaptive-mode Data messages (preBuilt == nil) it captures currentSlot AT
-// DEQUEUE — which is the moment closest to actual wire-time we can get
-// without invasive broadcaster surgery. This is the Bug-B fix: receivers'
-// "[SECURITY] arrived too late" cutoff is computed against this captured
-// slot, so a fresher slot means more messages survive the cutoff.
+// enqueueControlBroadcast hands an authentication-critical job (HMAC, key
+// disclosure, deterministic-mode HMAC) to the worker via the control lane.
+// The worker drains controlQueue strictly before dataQueue, so these never
+// starve behind trafficLoop's flood (Bug-X fix).
+func (r *RCD) enqueueControlBroadcast(job broadcastJob) error {
+	select {
+	case r.controlQueue <- job:
+		return nil
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	default:
+		atomic.AddUint64(&r.metrics.BroadcastQueueDrops, 1)
+		return fmt.Errorf("control queue full")
+	}
+}
+
+// broadcastWorker drains the priority queues through the throttled radio.
+// Each iteration prefers controlQueue (HMACs + disclosures); only when it is
+// empty does the worker take from dataQueue. This is the Bug-X fix:
+// authentication-critical traffic can't be starved behind trafficLoop's flood
+// of data messages.
+//
+// For adaptive-mode Data messages (preBuilt == nil) the worker captures
+// currentSlot AT DEQUEUE — the moment closest to actual wire-time we can get
+// without invasive broadcaster surgery. This is the Bug-B fix: the receiver's
+// "[SECURITY] arrived too late" cutoff is computed against this captured slot.
 func (r *RCD) broadcastWorker() {
 	defer r.wg.Done()
 	for {
+		// 1) Prefer control traffic: drain anything immediately available.
 		select {
 		case <-r.ctx.Done():
 			return
-		case job := <-r.broadcastQueue:
-			data := job.preBuilt
-			if data == nil {
-				// Build adaptive-mode Data message at send time.
-				assembled, ok := r.buildAdaptiveDataAtSendTime(job)
-				if !ok {
-					continue
-				}
-				data = assembled
-			}
-
-			start := time.Now()
-			err := r.broadcaster.Broadcast(r.ctx, data)
-			elapsed := time.Since(start)
-			r.observeBroadcastLatency(elapsed)
-			if r.enableBenchmarking {
-				atomic.AddInt64(&r.metrics.BroadcastDuration, elapsed.Nanoseconds())
-				atomic.AddInt64(&r.metrics.BroadcastCount, 1)
-			}
-			if err != nil {
-				log.Printf("Broadcast worker: send failed: %v", err)
-			}
+		case job := <-r.controlQueue:
+			r.transmit(job)
+			continue
+		default:
 		}
+
+		// 2) Otherwise wait on either lane (control still preferred on tie
+		//    by step 1 next iteration).
+		select {
+		case <-r.ctx.Done():
+			return
+		case job := <-r.controlQueue:
+			r.transmit(job)
+		case job := <-r.dataQueue:
+			r.transmit(job)
+		}
+	}
+}
+
+// transmit performs the actual broadcaster.Broadcast call and updates metrics.
+// Factored out so broadcastWorker's queue-priority logic stays readable.
+func (r *RCD) transmit(job broadcastJob) {
+	data := job.preBuilt
+	if data == nil {
+		assembled, ok := r.buildAdaptiveDataAtSendTime(job)
+		if !ok {
+			return
+		}
+		data = assembled
+	}
+
+	start := time.Now()
+	err := r.broadcaster.Broadcast(r.ctx, data)
+	elapsed := time.Since(start)
+	r.observeBroadcastLatency(elapsed)
+	if r.enableBenchmarking {
+		atomic.AddInt64(&r.metrics.BroadcastDuration, elapsed.Nanoseconds())
+		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
+	}
+	if err != nil {
+		log.Printf("Broadcast worker: send failed: %v", err)
 	}
 }
 

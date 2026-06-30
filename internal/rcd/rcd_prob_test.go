@@ -41,7 +41,8 @@ func TestFlushBatchProbabilistic(t *testing.T) {
 		broadcaster:        mb,
 		slotSource:         fs,
 		disclosureMessages: make(chan DisclosurePayload, 10),
-		broadcastQueue:     make(chan broadcastJob, 16),
+		controlQueue:       make(chan broadcastJob, 16),
+		dataQueue:          make(chan broadcastJob, 16),
 		hashChain:          hc,
 		hashchainLen:       16,
 		cachedKeySlot:      100,
@@ -65,12 +66,12 @@ func TestFlushBatchProbabilistic(t *testing.T) {
 		t.Fatalf("flushBatch error: %v", err)
 	}
 
-	// flushBatch now enqueues to broadcastQueue instead of calling the
-	// broadcaster directly; verify the queued bytes are an HMAC message.
-	if len(r.broadcastQueue) == 0 {
-		t.Fatalf("expected broadcast queue to have job, got 0")
+	// flushBatch now enqueues HMAC on the control lane (priority queue,
+	// Bug-X fix). Verify the queued bytes are an HMAC message.
+	if len(r.controlQueue) == 0 {
+		t.Fatalf("expected control queue to have job, got 0")
 	}
-	job := <-r.broadcastQueue
+	job := <-r.controlQueue
 	if job.preBuilt == nil {
 		t.Fatalf("expected preBuilt HMAC bytes, got nil")
 	}
