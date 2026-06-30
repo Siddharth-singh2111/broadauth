@@ -454,9 +454,19 @@ func (r *RCD) requestHashChainOnce(currentSlot uint64) error {
 // hands each message to r.broadcast(). It may block on the throttled radio,
 // but that no longer interferes with slot scheduling — slotLoop runs in its
 // own goroutine (F8).
+//
+// 100 ms cadence (10 Hz) is chosen against the broadcaster's ~50 B/s bottleneck
+// (internal/broadcast/udp_broadcast.go intentionally simulates a very weak
+// radio). At 50 Hz the Bloom filters per batch grew to ~270 bytes — each
+// disclosure msg took >7 s of radio time and starved data msgs, leaving the
+// receiver's unverifiedMsgs map empty and producing zero authentications. At
+// 10 Hz batches are 5× smaller, BFs are 5× smaller, disclosures take ~2.4 s
+// each, and ~20 data msgs fit through per 100 s run. D_i still saturates
+// (10 msgs/slot ≥ ingestQueueCap=10), so the controller's toggle remains
+// active.
 func (r *RCD) trafficLoop() {
 	defer r.wg.Done()
-	trafficTicker := time.NewTicker(20 * time.Millisecond)
+	trafficTicker := time.NewTicker(100 * time.Millisecond)
 	defer trafficTicker.Stop()
 
 	for {

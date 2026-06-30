@@ -51,7 +51,7 @@ func main() {
 		log.Println("Starting RCD in ADAPTIVE mode")
 	case "probadaptive", "probad":
 		mode = rcd.ModeProbAdaptive
-		log.Println("Starting RCD in ADAPTIVE mode")
+		log.Println("Starting RCD in PROB-ADAPTIVE mode")
 	default:
 		log.Fatalf("Unknown mode: %s", *modeStr)
 	}
