@@ -76,6 +76,7 @@ type Metrics struct {
 	MessagesReceived uint64
 	OverheadBytes    uint64 // Bytes used for HMACs, Keys, BloomFilters (non-payload)
 	DisclosureDrops  uint64 // F12: disclosure-queue overflow events (keys never disclosed)
+	BroadcastQueueDrops uint64 // Bug-C fix: broadcast worker queue full → message dropped
 
 	// Timing Metrics (Cumulative Nanoseconds)
 	HMACDuration      int64
@@ -102,6 +103,15 @@ type RCD struct {
 	broadcaster broadcast.Broadcaster
 	receiver    broadcast.Receiver
 	slotSource  slot.SlotSource
+
+	// broadcastQueue feeds a dedicated worker that drains through the
+	// throttled radio. With trafficLoop, slotLoop (flush HMAC), and
+	// disclosureWorker all pushing to the same queue, the worker serializes
+	// onto the broadcaster but the producers never block — which lets
+	// messageBuffer actually accumulate, lets the controller's D_i react to
+	// real load, and lets the worker capture sched.Index at send time
+	// (Bug-B fix).
+	broadcastQueue chan broadcastJob
 
 	disclosureMessages chan DisclosurePayload
 	receivedHMACs      sync.Map
@@ -139,6 +149,19 @@ type DisclosurePayload struct {
 	Message    []byte
 	Key        [32]byte
 	TargetSlot uint64
+}
+
+// broadcastJob is a unit of work for broadcastWorker. Either preBuilt is a
+// fully-marshalled message (HMAC, key disclosure, deterministic data) ready
+// to send as-is, OR preBuilt is nil and the worker assembles a fresh
+// adaptive-mode Data message at dequeue time using rawData + the worker's
+// captured currentSlot. The latter path is the Bug-B fix: sched.Index now
+// reflects when the packet actually goes on the wire, not when traffic was
+// generated 9+ seconds earlier behind the throttled broadcaster.
+type broadcastJob struct {
+	preBuilt []byte
+	rawData  []byte
+	mode     Mode
 }
 
 type Config struct {
@@ -211,6 +234,7 @@ func New(cfg Config) (*RCD, error) {
 		receiver:           receiver,
 		slotSource:         slotSource,
 		disclosureMessages: make(chan DisclosurePayload, 1024),
+		broadcastQueue:     make(chan broadcastJob, 4096),
 		messageBuffer:      make([][]byte, 0),
 		mode:               cfg.Mode,
 		tMin:               cfg.TMin,
@@ -236,18 +260,25 @@ func (r *RCD) Start() error {
 	// stalls slot ticks, congestion sampling, and batch flushes behind every
 	// traffic broadcast. Splitting them lets the controller sample state and
 	// emit batches on schedule regardless of radio backpressure.
+	//
+	// Bug-C: an additional broadcastWorker drains all four broadcast sites
+	// (trafficLoop data msgs, slotLoop flush HMACs, disclosureWorker key
+	// disclosures, deterministic-mode HMACs) so producers never block on
+	// b.mu/Sleep. messageBuffer fills at trafficLoop rate (50 Hz), so D_i
+	// finally has a non-trivial signal to react to.
 	if r.enableBenchmarking {
-		r.wg.Add(5)
+		r.wg.Add(6)
 		go r.benchmarkWorker()
 	} else {
 		log.SetOutput(os.Stderr)
-		r.wg.Add(4)
+		r.wg.Add(5)
 	}
 
 	go r.trafficLoop()
 	go r.slotLoop()
 	go r.disclosureWorker()
 	go r.cleanupWorker()
+	go r.broadcastWorker()
 
 	modeStr := "DETERMINISTIC"
 	switch r.mode {
@@ -507,6 +538,33 @@ func (r *RCD) CurrentSlotKey() (slot.Slot, []byte, error) {
 }
 
 func (r *RCD) broadcast(data []byte) error {
+	// Probabilistic and prob-adaptive modes: append to messageBuffer FIRST so
+	// the controller's D_i reflects real load, then enqueue the raw data for
+	// the worker (which captures sched.Index at send time). trafficLoop never
+	// blocks on the radio — that's what Bug C was about.
+	if r.mode == ModeProbabilistic || r.mode == ModeProbAdaptive {
+		r.bufferMutex.Lock()
+		r.messageBuffer = append(r.messageBuffer, data)
+		bufLen := len(r.messageBuffer)
+		r.bufferMutex.Unlock()
+		if r.mode == ModeProbAdaptive {
+			log.Printf("[PROB-ADAPTIVE: INGEST] Buffered packet. Current batch size: %d", bufLen)
+		}
+
+		if r.enableBenchmarking {
+			atomic.AddUint64(&r.metrics.MessagesSent, 1)
+		}
+
+		// Enqueue raw data; worker will marshal with a fresh slot at send.
+		if err := r.enqueueBroadcast(broadcastJob{rawData: data, mode: r.mode}); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Deterministic & adaptive modes still need HMAC computed at generation
+	// time (so it covers the same sched.Index the receiver sees), so we
+	// build the bytes here and enqueue them as preBuilt.
 	currentSlot, key, err := r.CurrentSlotKey()
 	if err != nil {
 		return fmt.Errorf("failed to get current slot/key: %v", err)
@@ -515,8 +573,7 @@ func (r *RCD) broadcast(data []byte) error {
 	var payloadToBroadcast []byte
 	var sched Schedule
 
-	// 1. Pack data with schedule if in ANY adaptive mode
-	if r.mode == ModeAdaptive || r.mode == ModeProbAdaptive {
+	if r.mode == ModeAdaptive {
 		r.bufferMutex.Lock()
 		sched = Schedule{
 			Index:    currentSlot,
@@ -525,13 +582,11 @@ func (r *RCD) broadcast(data []byte) error {
 		}
 		r.adaptiveOffset += r.adaptiveT
 		r.bufferMutex.Unlock()
-
 		payloadToBroadcast = packAdaptiveData(sched, data)
 	} else {
 		payloadToBroadcast = data
 	}
 
-	// 2. Broadcast the Data Message (Safely containing the Schedule if Adaptive)
 	dataMsg := message.NewMessage(r.id, currentSlot, message.MessageKindData, payloadToBroadcast)
 	msgBytes, err := dataMsg.Marshal()
 	if err != nil {
@@ -543,29 +598,15 @@ func (r *RCD) broadcast(data []byte) error {
 		atomic.AddUint64(&r.metrics.MessagesSent, 1)
 	}
 
-	start := time.Now()
-	err = r.broadcaster.Broadcast(r.ctx, msgBytes)
-	elapsed := time.Since(start)
-	r.observeBroadcastLatency(elapsed) // F6: live recency-weighted latency signal
-	if r.enableBenchmarking {
-		atomic.AddInt64(&r.metrics.BroadcastDuration, elapsed.Nanoseconds())
-		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
+	if err := r.enqueueBroadcast(broadcastJob{preBuilt: msgBytes}); err != nil {
+		return err
 	}
 
-	if err != nil {
-		return fmt.Errorf("failed to broadcast data message: %v", err)
-	}
-
-	// 3. Route to the correct Cryptographic mechanism
 	switch r.mode {
 	case ModeDeterministic:
 		return r.broadcastDeterministic(data, key, currentSlot)
-	case ModeProbabilistic:
-		return r.broadcastProbabilistic(data)
 	case ModeAdaptive:
 		return r.broadcastAdaptive(payloadToBroadcast, key, currentSlot, sched)
-	case ModeProbAdaptive:
-		return r.broadcastProbadaptive(data)
 	default:
 		return fmt.Errorf("unknown mode")
 	}
@@ -591,15 +632,8 @@ func (r *RCD) broadcastDeterministic(data []byte, key []byte, currentSlot uint64
 		atomic.AddUint64(&r.metrics.OverheadBytes, l)
 	}
 
-	startBroadcast := time.Now()
-	err = r.broadcaster.Broadcast(r.ctx, hmacData)
-	if r.enableBenchmarking {
-		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(startBroadcast).Nanoseconds())
-		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
-	}
-
-	if err != nil {
-		return fmt.Errorf("failed to broadcast HMAC message: %v", err)
+	if err := r.enqueueBroadcast(broadcastJob{preBuilt: hmacData}); err != nil {
+		return fmt.Errorf("failed to enqueue HMAC message: %v", err)
 	}
 
 	log.Printf("Sent HMAC message for slot %d", currentSlot)
@@ -622,20 +656,10 @@ func (r *RCD) broadcastDeterministic(data []byte, key []byte, currentSlot uint64
 	return nil
 }
 
-func (r *RCD) broadcastProbabilistic(data []byte) error {
-	r.bufferMutex.Lock()
-	defer r.bufferMutex.Unlock()
-	r.messageBuffer = append(r.messageBuffer, data)
-	return nil
-}
-
-func (r *RCD) broadcastProbadaptive(data []byte) error {
-	r.bufferMutex.Lock()
-	defer r.bufferMutex.Unlock()
-	r.messageBuffer = append(r.messageBuffer, data)
-	log.Printf("[PROB-ADAPTIVE: INGEST] Buffered packet. Current batch size: %d", len(r.messageBuffer))
-	return nil
-}
+// broadcastProbabilistic / broadcastProbadaptive were folded into r.broadcast's
+// ModeProbabilistic / ModeProbAdaptive branch as part of the Bug-C fix — the
+// buffer append now happens BEFORE the radio enqueue so the controller's D_i
+// reflects load in real time.
 
 func (r *RCD) broadcastAdaptive(packedData []byte, key []byte, currentSlot uint64, sched Schedule) error {
 	startHMAC := time.Now()
@@ -657,15 +681,8 @@ func (r *RCD) broadcastAdaptive(packedData []byte, key []byte, currentSlot uint6
 		atomic.AddUint64(&r.metrics.OverheadBytes, l)
 	}
 
-	startBroadcast := time.Now()
-	err = r.broadcaster.Broadcast(r.ctx, hmacData)
-	if r.enableBenchmarking {
-		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(startBroadcast).Nanoseconds())
-		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
-	}
-
-	if err != nil {
-		return fmt.Errorf("failed to broadcast adaptive HMAC message: %v", err)
+	if err := r.enqueueBroadcast(broadcastJob{preBuilt: hmacData}); err != nil {
+		return fmt.Errorf("failed to enqueue adaptive HMAC message: %v", err)
 	}
 
 	log.Printf("Sent Adaptive HMAC message for slot %d (T_i: %dms)", currentSlot, sched.Duration)
@@ -729,15 +746,8 @@ func (r *RCD) flushBatch(slot uint64) error {
 		atomic.AddUint64(&r.metrics.OverheadBytes, l)
 	}
 
-	startBroadcast := time.Now()
-	err = r.broadcaster.Broadcast(r.ctx, hmacBytes)
-	if r.enableBenchmarking {
-		atomic.AddInt64(&r.metrics.BroadcastDuration, time.Since(startBroadcast).Nanoseconds())
-		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
-	}
-
-	if err != nil {
-		return fmt.Errorf("failed to broadcast batch HMAC message: %v", err)
+	if err := r.enqueueBroadcast(broadcastJob{preBuilt: hmacBytes}); err != nil {
+		return fmt.Errorf("failed to enqueue batch HMAC message: %v", err)
 	}
 
 	log.Printf("Sent HMAC message (Batch of %d messages) for slot %d", count, slot)
@@ -831,24 +841,16 @@ func (r *RCD) flushAdaptiveBatch(slot uint64) error {
 		return fmt.Errorf("disclosure queue full")
 	}
 
-	// --- NOW BROADCAST (AND BLOCK) ---
+	// --- ENQUEUE HMAC (worker handles the slow radio Sleep — Bug C fix) ---
 	if r.enableBenchmarking {
 		l := uint64(len(hmacBytes))
 		atomic.AddUint64(&r.metrics.BytesSent, l)
 		atomic.AddUint64(&r.metrics.OverheadBytes, l)
 	}
 
-	startBcast := time.Now()
-	err = r.broadcaster.Broadcast(r.ctx, hmacBytes)
-	elapsedBcast := time.Since(startBcast)
-	r.observeBroadcastLatency(elapsedBcast) // F6
-	if r.enableBenchmarking {
-		atomic.AddInt64(&r.metrics.BroadcastDuration, elapsedBcast.Nanoseconds())
-		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
-	}
-	if err != nil {
-		log.Printf("[PROB-ADAPTIVE: FLUSH-ERROR] Broadcast failed on slot %d: %v", slot, err)
-		return fmt.Errorf("failed to broadcast adaptive batch HMAC: %v", err)
+	if err := r.enqueueBroadcast(broadcastJob{preBuilt: hmacBytes}); err != nil {
+		log.Printf("[PROB-ADAPTIVE: FLUSH-ERROR] Enqueue failed on slot %d: %v", slot, err)
+		return fmt.Errorf("failed to enqueue adaptive batch HMAC: %v", err)
 	}
 
 	log.Printf("[PROB-ADAPTIVE: FLUSH-SUCCESS] Batch of %d packets for slot %d broadcasted successfully.", count, slot)
@@ -905,17 +907,8 @@ func (r *RCD) disclosureWorker() {
 						atomic.AddUint64(&r.metrics.OverheadBytes, l)
 					}
 
-					startBroadcast := time.Now()
-					err := r.broadcaster.Broadcast(r.ctx, data)
-					elapsed := time.Since(startBroadcast)
-					r.observeBroadcastLatency(elapsed) // F6
-					if r.enableBenchmarking {
-						atomic.AddInt64(&r.metrics.BroadcastDuration, elapsed.Nanoseconds())
-						atomic.AddInt64(&r.metrics.BroadcastCount, 1)
-					}
-
-					if err != nil {
-						log.Printf("Failed to broadcast disclosure: %v", err)
+					if err := r.enqueueBroadcast(broadcastJob{preBuilt: data}); err != nil {
+						log.Printf("Failed to enqueue disclosure: %v", err)
 					} else {
 						log.Printf("Sent key disclosure message for slot %d", currentSlot)
 					}
@@ -1038,7 +1031,17 @@ func (r *RCD) handleMessage(data []byte) {
 			bf := bloom.FromBytes(payload)
 			if bf != nil {
 				targetSlot := receivedMessage.Slot - r.disclosureDelay
-				msgs := r.getUnverifiedMessages(targetSlot)
+				// Bug-A fix: data messages can be stored under sched.Index
+				// values arbitrarily far from this batch's flush slot — there
+				// is no slot-arithmetic relationship between when a data msg
+				// was generated and when its batch's flush happened, only a
+				// content (BF membership) relationship. Iterate ALL pending
+				// unverified messages; the BF itself decides membership.
+				var msgs [][]byte
+				r.unverifiedMsgs.Range(func(_, v interface{}) bool {
+					msgs = append(msgs, v.([][]byte)...)
+					return true
+				})
 
 				verifiedCount := 0
 				for _, m := range msgs {
@@ -1050,9 +1053,10 @@ func (r *RCD) handleMessage(data []byte) {
 				if verifiedCount > 0 {
 					log.Printf("[SUCCESS] Probabilistic Batch Verification: %d messages authenticated for slot %d", verifiedCount, targetSlot)
 				} else {
-					log.Printf("[BATCH-EMPTY] Probabilistic Batch Verification: 0 messages authenticated for slot %d (Bloom filter matched none of the buffered messages — likely all data msgs arrived past security cutoff)", targetSlot)
+					log.Printf("[BATCH-EMPTY] Probabilistic Batch Verification: 0 messages authenticated for slot %d (Bloom filter matched none of the buffered messages)", targetSlot)
 				}
-				r.unverifiedMsgs.Delete(targetSlot)
+				// Don't bulk-delete: msgs not in this BF may match a later
+				// batch's BF. cleanupWorker evicts after disclosureDelay+20.
 			}
 		case ModeAdaptive:
 			sched, actualData, err := unpackAdaptiveData(payload)
@@ -1071,13 +1075,18 @@ func (r *RCD) handleMessage(data []byte) {
 			bf := bloom.FromBytes(bfPayload)
 			if bf != nil {
 				targetSlot := receivedMessage.Slot - r.disclosureDelay
-				
-				// --- FIX 3: Jitter-Resistant Verification Window ---
-				// Because data and flushes run asynchronously, packets often straddle slot boundaries.
+
+				// Bug-A fix: iterate ALL pending unverified messages. Even
+				// the prior ±1 "jitter-resistant" window assumed that
+				// sched.Index ≈ flush slot, but with the broadcast worker
+				// queue (Bug-C fix) sched.Index can lag the flush slot by
+				// many slots. Membership is determined by the BF, not by
+				// slot arithmetic.
 				var msgs [][]byte
-				msgs = append(msgs, r.getUnverifiedMessages(targetSlot-1)...)
-				msgs = append(msgs, r.getUnverifiedMessages(targetSlot)...)
-				msgs = append(msgs, r.getUnverifiedMessages(targetSlot+1)...)
+				r.unverifiedMsgs.Range(func(_, v interface{}) bool {
+					msgs = append(msgs, v.([][]byte)...)
+					return true
+				})
 
 				verifiedCount := 0
 				for _, m := range msgs {
@@ -1088,13 +1097,9 @@ func (r *RCD) handleMessage(data []byte) {
 				if verifiedCount > 0 {
 					log.Printf("[SUCCESS] Prob-Adaptive Batch Verification: %d messages authenticated for slot %d (T_i: %dms)", verifiedCount, targetSlot, sched.Duration)
 				} else {
-					log.Printf("[BATCH-EMPTY] Prob-Adaptive Batch Verification: 0 messages authenticated for slot %d (T_i: %dms) — Bloom filter unpacked OK, but no buffered messages matched (likely dropped as 'arrived too late')", targetSlot, sched.Duration)
+					log.Printf("[BATCH-EMPTY] Prob-Adaptive Batch Verification: 0 messages authenticated for slot %d (T_i: %dms)", targetSlot, sched.Duration)
 				}
-
-				// Cleanup the window
-				r.unverifiedMsgs.Delete(targetSlot - 1)
-				r.unverifiedMsgs.Delete(targetSlot)
-				r.unverifiedMsgs.Delete(targetSlot + 1)
+				// cleanupWorker evicts unverified msgs after retention threshold.
 			}
 		default:
 			log.Printf("[SUCCESS] Verified message from %s: %s", receivedMessage.SenderID, string(payload))
@@ -1230,6 +1235,96 @@ func (r *RCD) broadcastLatencyEWMAms() float64 {
 	r.latencyMu.Lock()
 	defer r.latencyMu.Unlock()
 	return r.latencyEWMAms
+}
+
+// enqueueBroadcast hands a broadcast job to the worker. Non-blocking: if the
+// queue is full we drop and count it. Producers (trafficLoop, slotLoop,
+// disclosureWorker, deterministic HMAC path) must never block on the radio.
+func (r *RCD) enqueueBroadcast(job broadcastJob) error {
+	select {
+	case r.broadcastQueue <- job:
+		return nil
+	case <-r.ctx.Done():
+		return r.ctx.Err()
+	default:
+		atomic.AddUint64(&r.metrics.BroadcastQueueDrops, 1)
+		return fmt.Errorf("broadcast queue full")
+	}
+}
+
+// broadcastWorker drains broadcastQueue through the throttled radio. For
+// adaptive-mode Data messages (preBuilt == nil) it captures currentSlot AT
+// DEQUEUE — which is the moment closest to actual wire-time we can get
+// without invasive broadcaster surgery. This is the Bug-B fix: receivers'
+// "[SECURITY] arrived too late" cutoff is computed against this captured
+// slot, so a fresher slot means more messages survive the cutoff.
+func (r *RCD) broadcastWorker() {
+	defer r.wg.Done()
+	for {
+		select {
+		case <-r.ctx.Done():
+			return
+		case job := <-r.broadcastQueue:
+			data := job.preBuilt
+			if data == nil {
+				// Build adaptive-mode Data message at send time.
+				assembled, ok := r.buildAdaptiveDataAtSendTime(job)
+				if !ok {
+					continue
+				}
+				data = assembled
+			}
+
+			start := time.Now()
+			err := r.broadcaster.Broadcast(r.ctx, data)
+			elapsed := time.Since(start)
+			r.observeBroadcastLatency(elapsed)
+			if r.enableBenchmarking {
+				atomic.AddInt64(&r.metrics.BroadcastDuration, elapsed.Nanoseconds())
+				atomic.AddInt64(&r.metrics.BroadcastCount, 1)
+			}
+			if err != nil {
+				log.Printf("Broadcast worker: send failed: %v", err)
+			}
+		}
+	}
+}
+
+// buildAdaptiveDataAtSendTime captures the current slot just before the radio
+// actually transmits, so sched.Index reflects wire-time, not generation-time.
+// The receiver's cutoff (sched.Index + disclosureDelay) is computed against
+// this fresher value, which collapses the late-drop window from "9+ seconds
+// of broadcaster latency" down to "single-digit milliseconds of dequeue
+// overhead". Returns (bytes, true) on success.
+func (r *RCD) buildAdaptiveDataAtSendTime(job broadcastJob) ([]byte, bool) {
+	currentSlot, _, err := r.CurrentSlotKey()
+	if err != nil {
+		log.Printf("Broadcast worker: skip — no current slot/key: %v", err)
+		return nil, false
+	}
+
+	var payload []byte
+	if job.mode == ModeAdaptive || job.mode == ModeProbAdaptive {
+		r.bufferMutex.Lock()
+		sched := Schedule{
+			Index:    currentSlot,
+			Duration: r.adaptiveT,
+			Offset:   r.adaptiveOffset,
+		}
+		r.adaptiveOffset += r.adaptiveT
+		r.bufferMutex.Unlock()
+		payload = packAdaptiveData(sched, job.rawData)
+	} else {
+		payload = job.rawData
+	}
+
+	msg := message.NewMessage(r.id, currentSlot, message.MessageKindData, payload)
+	bytes, err := msg.Marshal()
+	if err != nil {
+		log.Printf("Broadcast worker: marshal failed: %v", err)
+		return nil, false
+	}
+	return bytes, true
 }
 
 func (r *RCD) selectDuration(score float64, currentT uint64) uint64 {

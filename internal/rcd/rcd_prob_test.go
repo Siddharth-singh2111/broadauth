@@ -41,6 +41,7 @@ func TestFlushBatchProbabilistic(t *testing.T) {
 		broadcaster:        mb,
 		slotSource:         fs,
 		disclosureMessages: make(chan DisclosurePayload, 10),
+		broadcastQueue:     make(chan broadcastJob, 16),
 		hashChain:          hc,
 		hashchainLen:       16,
 		cachedKeySlot:      100,
@@ -48,30 +49,34 @@ func TestFlushBatchProbabilistic(t *testing.T) {
 		mode:               ModeProbabilistic,
 		messageBuffer:      make([][]byte, 0),
 	}
+	// enqueueBroadcast selects on r.ctx.Done(); set a context for the test.
+	r.ctx, r.cancel = context.WithCancel(context.Background())
+	defer r.cancel()
 
 	// prime cached key
 	key := hc.Next()
 	copy(r.cachedKey[:], key)
 
-	// Buffer a couple of messages and flush
-	if err := r.broadcastProbabilistic([]byte("m1")); err != nil {
-		t.Fatalf("buffer failed: %v", err)
-	}
-	if err := r.broadcastProbabilistic([]byte("m2")); err != nil {
-		t.Fatalf("buffer failed: %v", err)
-	}
+	// Bug-C fix folded broadcastProbabilistic into r.broadcast — append direct.
+	r.messageBuffer = append(r.messageBuffer, []byte("m1"))
+	r.messageBuffer = append(r.messageBuffer, []byte("m2"))
 
 	if err := r.flushBatch(100); err != nil {
 		t.Fatalf("flushBatch error: %v", err)
 	}
 
-	if len(mb.msgs) == 0 {
-		t.Fatalf("expected broadcaster to have messages, got 0")
+	// flushBatch now enqueues to broadcastQueue instead of calling the
+	// broadcaster directly; verify the queued bytes are an HMAC message.
+	if len(r.broadcastQueue) == 0 {
+		t.Fatalf("expected broadcast queue to have job, got 0")
 	}
-
+	job := <-r.broadcastQueue
+	if job.preBuilt == nil {
+		t.Fatalf("expected preBuilt HMAC bytes, got nil")
+	}
 	var msg message.Message
-	if err := msg.Unmarshal(mb.msgs[0]); err != nil {
-		t.Fatalf("failed to unmarshal broadcasted message: %v", err)
+	if err := msg.Unmarshal(job.preBuilt); err != nil {
+		t.Fatalf("failed to unmarshal queued message: %v", err)
 	}
 	if msg.Kind != message.MessageKindHMAC {
 		t.Fatalf("expected HMAC message kind, got %v", msg.Kind)

@@ -25,19 +25,14 @@ OWNER_PORT = "10102"
 OWNER_PRIV_KEY = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"
 CM_ADDR = "0.0.0.0:10101"
 HASHCHAIN_LEN = "1024"
-# F2 / Fix 2: raised from "2" to "10".
-# Rationale: the throttled UDP broadcaster (internal/broadcast/udp_broadcast.go)
-# takes ~len(msg)/50 seconds per send, ~2 s for a 100-byte data message — and
-# that's before HMAC and key-disclosure broadcasts contend for the same mutex.
-# Wall-time per data-message round-trip is ~9 s in practice. With
-# disclosureDelay=2 (i.e. cutoff = 2 × T_min = 2 s), every data message arrives
-# past its security cutoff and is dropped as 'arrived too late', so every
-# batch verification authenticates zero messages — even at 0% loss.
-# Setting the cutoff to 10 s (10 × T_min) gives the broadcaster enough headroom
-# to actually deliver data messages before the receiver rejects them. Long-term,
-# the fix belongs in the radio model (F15) or in capturing sched.Index at send
-# time rather than generation time (Option A broadcast queue).
-DISCLOSURE_DELAY = "10"
+# Fix 2 (now superseded by Bug-B fix in rcd.go but kept generous for safety):
+# the throttled UDP broadcaster (internal/broadcast/udp_broadcast.go) takes
+# ~len(msg)/50 seconds per send. With 3 message types contending for the same
+# mutex, real round-trip latency was ~9 s. With the new broadcast worker queue
+# AND sched.Index captured at send time (rcd.go: buildAdaptiveDataAtSendTime),
+# the wall-time-to-receiver is now milliseconds, so a 30-slot cutoff at
+# T_min=1000 ms gives 30 s of headroom — far beyond what should now be needed.
+DISCLOSURE_DELAY = "30"
 
 # Regex Parsers
 RE_DI = re.compile(r"D_i \(Queue\): ([\d\.]+)")
