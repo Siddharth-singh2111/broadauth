@@ -1168,14 +1168,6 @@ func (r *RCD) storeUnverifiedMessage(slot uint64, data []byte) {
 	r.unverifiedMsgs.Store(slot, msgs)
 }
 
-func (r *RCD) getUnverifiedMessages(slot uint64) [][]byte {
-	value, ok := r.unverifiedMsgs.Load(slot)
-	if !ok {
-		return nil
-	}
-	return value.([][]byte)
-}
-
 func packAdaptiveData(sched Schedule, data []byte) []byte {
 	buf := make([]byte, 24+len(data))
 	binary.BigEndian.PutUint64(buf[0:8], sched.Index)

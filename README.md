@@ -23,8 +23,6 @@ cd ..
 
 ```bash
 abigen --abi=contracts/out/InfTESLAPlusPlus.sol/InfTESLAplusplus.abi.json --bin=contracts/out/InfTESLAPlusPlus.sol/InfTESLAplusplus.bin --pkg=contract --type=Contract --out=internal/contract/contract.go
-
-abigen --abi contracts/out/Counter.sol/Counter.abi.json --bin contracts/out/Counter.sol/Counter.bin --pkg contract --type Counter --out internal/contract/contract.go
 ```
 
 * Compile all the binaries
