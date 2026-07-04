@@ -99,6 +99,7 @@ type RCD struct {
 	simulationTime  time.Duration
 	startTime       time.Time
 	messageCounter  uint64
+	trafficInterval time.Duration // Step 2: 1/TrafficHz — the offered-load cadence
 
 	broadcaster broadcast.Broadcaster
 	receiver    broadcast.Receiver
@@ -182,6 +183,10 @@ type Config struct {
 	EnableBenchmarking bool
 	TMin               uint64
 	TMax               uint64
+	// TrafficHz is the offered-load knob (Step 2): application-traffic
+	// generation rate in messages/sec. This is the experiment's independent
+	// variable for the load sweep. <= 0 falls back to the 10 Hz default.
+	TrafficHz float64
 }
 
 type Schedule struct {
@@ -228,6 +233,15 @@ func New(cfg Config) (*RCD, error) {
 		}
 	}
 
+	// Step 2: derive the traffic cadence from the offered-load knob. <= 0
+	// falls back to the 10 Hz default (100 ms) that Bug-CC calibrated against
+	// the throttled radio.
+	trafficHz := cfg.TrafficHz
+	if trafficHz <= 0 {
+		trafficHz = 10.0
+	}
+	trafficInterval := time.Duration(float64(time.Second) / trafficHz)
+
 	return &RCD{
 		id:                 cfg.UUID,
 		ownerAddr:          cfg.OwnerAddr,
@@ -236,6 +250,7 @@ func New(cfg Config) (*RCD, error) {
 		hashchainLen:       cfg.HashchainLen,
 		disclosureDelay:    cfg.DisclosureDelay,
 		simulationTime:     cfg.SimulationTime,
+		trafficInterval:    trafficInterval,
 		broadcaster:        broadcaster,
 		receiver:           receiver,
 		slotSource:         slotSource,
@@ -455,18 +470,17 @@ func (r *RCD) requestHashChainOnce(currentSlot uint64) error {
 // but that no longer interferes with slot scheduling — slotLoop runs in its
 // own goroutine (F8).
 //
-// 100 ms cadence (10 Hz) is chosen against the broadcaster's ~50 B/s bottleneck
-// (internal/broadcast/udp_broadcast.go intentionally simulates a very weak
-// radio). At 50 Hz the Bloom filters per batch grew to ~270 bytes — each
-// disclosure msg took >7 s of radio time and starved data msgs, leaving the
-// receiver's unverifiedMsgs map empty and producing zero authentications. At
-// 10 Hz batches are 5× smaller, BFs are 5× smaller, disclosures take ~2.4 s
-// each, and ~20 data msgs fit through per 100 s run. D_i still saturates
-// (10 msgs/slot ≥ ingestQueueCap=10), so the controller's toggle remains
-// active.
+// The cadence is r.trafficInterval = 1/TrafficHz, set via the -traffic-hz flag
+// (Step 2). It defaults to 10 Hz (100 ms), the rate Bug-CC calibrated against
+// the broadcaster's ~50 B/s bottleneck (internal/broadcast/udp_broadcast.go
+// intentionally simulates a very weak radio): at 50 Hz the per-batch Bloom
+// filters grew large enough that disclosures starved data msgs and zero
+// messages authenticated, whereas at 10 Hz D_i still saturates
+// (>= ingestQueueCap) so the toggle stays active while data still gets through.
+// For the load sweep this rate becomes the swept independent variable.
 func (r *RCD) trafficLoop() {
 	defer r.wg.Done()
-	trafficTicker := time.NewTicker(100 * time.Millisecond)
+	trafficTicker := time.NewTicker(r.trafficInterval)
 	defer trafficTicker.Stop()
 
 	for {

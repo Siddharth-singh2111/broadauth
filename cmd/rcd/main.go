@@ -25,6 +25,7 @@ func main() {
 	bench := flag.Bool("bench", false, "Enable runtime benchmarking metrics")
 	tMin := flag.Uint64("t-min", 1000, "Minimum slot duration in ms (Adaptive Mode)")
 	tMax := flag.Uint64("t-max", 10000, "Maximum slot duration in ms (Adaptive Mode)")
+	trafficHz := flag.Float64("traffic-hz", 10.0, "Application traffic generation rate in messages/sec (offered-load knob)")
 
 	flag.Parse()
 
@@ -68,6 +69,7 @@ func main() {
 		EnableBenchmarking: *bench,
 		TMin:               *tMin,
 		TMax:               *tMax,
+		TrafficHz:          *trafficHz,
 	}
 
 	r, err := rcd.New(cfg)
