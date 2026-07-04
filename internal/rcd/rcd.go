@@ -41,12 +41,12 @@ const (
 const (
 	// --- Congestion controller tuning (Prob-Adaptive Inf-TESLA++, §IV) ---
 
-	// ingestQueueCap is Q_cap in D_i = Q_len / Q_cap. Q_len is the ingest
-	// (pre-flush) backlog of unauthenticated packets — the place where genuine
-	// backpressure accumulates when the radio/disclosure pipeline cannot keep
-	// up. (F4: this replaces the old magic 10.0 whose comment wrongly said 100.
-	// The real per-device value should be calibrated; see the tuner, F25.)
-	ingestQueueCap = 10.0
+	// defaultIngestQueueCap is the fallback Q_cap in D_i = Q_len / Q_cap. Q_len
+	// is the ingest (pre-flush) backlog of unauthenticated packets — where
+	// genuine backpressure accumulates. It is overridable per-run via the
+	// -ingest-cap flag (Step 3) so the value can be calibrated from load-sweep
+	// data rather than guessed; this constant is only the default.
+	defaultIngestQueueCap = 10.0
 
 	// latencyBaselineMs is L_base in B_i = min(1, L_avg / L_base). Single source
 	// of truth — matches the paper's 20 ms (F3 removes the divergent 50 ms path).
@@ -100,6 +100,7 @@ type RCD struct {
 	startTime       time.Time
 	messageCounter  uint64
 	trafficInterval time.Duration // Step 2: 1/TrafficHz — the offered-load cadence
+	ingestQueueCap  float64       // Step 3: Q_cap for D_i (from -ingest-cap)
 
 	broadcaster broadcast.Broadcaster
 	receiver    broadcast.Receiver
@@ -187,6 +188,10 @@ type Config struct {
 	// generation rate in messages/sec. This is the experiment's independent
 	// variable for the load sweep. <= 0 falls back to the 10 Hz default.
 	TrafficHz float64
+	// IngestQueueCap is Q_cap in D_i = Q_len / Q_cap (Step 3). Overridable so
+	// the value can be calibrated from load-sweep data. <= 0 falls back to
+	// defaultIngestQueueCap.
+	IngestQueueCap float64
 }
 
 type Schedule struct {
@@ -242,6 +247,12 @@ func New(cfg Config) (*RCD, error) {
 	}
 	trafficInterval := time.Duration(float64(time.Second) / trafficHz)
 
+	// Step 3: ingest-queue capacity for D_i, overridable via -ingest-cap.
+	ingestCap := cfg.IngestQueueCap
+	if ingestCap <= 0 {
+		ingestCap = defaultIngestQueueCap
+	}
+
 	return &RCD{
 		id:                 cfg.UUID,
 		ownerAddr:          cfg.OwnerAddr,
@@ -251,6 +262,7 @@ func New(cfg Config) (*RCD, error) {
 		disclosureDelay:    cfg.DisclosureDelay,
 		simulationTime:     cfg.SimulationTime,
 		trafficInterval:    trafficInterval,
+		ingestQueueCap:     ingestCap,
 		broadcaster:        broadcaster,
 		receiver:           receiver,
 		slotSource:         slotSource,
@@ -509,6 +521,13 @@ func (r *RCD) slotLoop() {
 		case <-r.ctx.Done():
 			return
 		case currentSlot := <-slotTicker:
+			// Step 3 jitter fix: sample the ingest backlog under bufferMutex
+			// BEFORE dispatching the flush goroutine (which clears the buffer),
+			// so D_i deterministically reflects the pre-flush peak.
+			r.bufferMutex.Lock()
+			backlog := len(r.messageBuffer)
+			r.bufferMutex.Unlock()
+
 			go func(slotToFlush uint64) {
 				switch r.mode {
 				case ModeProbAdaptive:
@@ -525,7 +544,7 @@ func (r *RCD) slotLoop() {
 			if r.mode == ModeAdaptive || r.mode == ModeProbAdaptive {
 				// F2/F3: D_i, B_i and the score all come from one place, so the
 				// logged metrics are exactly what the controller acts on.
-				di, bi, score := r.calculateTimeCongestion()
+				di, bi, score := r.calculateTimeCongestion(backlog)
 
 				// F2/F12: surface the pipeline-health outcomes the paper's
 				// failure mode is about. Occupancy of the three bounded queues,
@@ -1269,12 +1288,14 @@ func (r *RCD) calculateHMAC(key, data []byte) []byte {
 //
 // B_i uses the recency-weighted (EWMA) latency so the signal can recover when
 // pressure subsides; a cumulative mean cannot decay and would pin B_i high (F6).
-func (r *RCD) calculateTimeCongestion() (di float64, bi float64, score float64) {
-	r.bufferMutex.Lock()
-	backlog := float64(len(r.messageBuffer))
-	r.bufferMutex.Unlock()
-
-	di = backlog / ingestQueueCap
+//
+// The backlog is supplied by the caller (slotLoop), which samples it under
+// bufferMutex BEFORE dispatching the per-slot flush, so D_i deterministically
+// reflects the pre-flush peak instead of racing the flush goroutine that clears
+// the buffer (Step 3 jitter fix). D_i is normalized by r.ingestQueueCap
+// (-ingest-cap flag).
+func (r *RCD) calculateTimeCongestion(backlog int) (di float64, bi float64, score float64) {
+	di = float64(backlog) / r.ingestQueueCap
 	if di > 1.0 {
 		di = 1.0
 	}

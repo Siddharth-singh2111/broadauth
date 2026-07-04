@@ -26,6 +26,7 @@ func main() {
 	tMin := flag.Uint64("t-min", 1000, "Minimum slot duration in ms (Adaptive Mode)")
 	tMax := flag.Uint64("t-max", 10000, "Maximum slot duration in ms (Adaptive Mode)")
 	trafficHz := flag.Float64("traffic-hz", 10.0, "Application traffic generation rate in messages/sec (offered-load knob)")
+	ingestCap := flag.Float64("ingest-cap", 10.0, "Ingest-queue capacity Q_cap for D_i normalization (congestion controller)")
 
 	flag.Parse()
 
@@ -70,6 +71,7 @@ func main() {
 		TMin:               *tMin,
 		TMax:               *tMax,
 		TrafficHz:          *trafficHz,
+		IngestQueueCap:     *ingestCap,
 	}
 
 	r, err := rcd.New(cfg)
