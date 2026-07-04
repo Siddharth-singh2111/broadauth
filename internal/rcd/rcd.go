@@ -562,8 +562,9 @@ func (r *RCD) slotLoop() {
 				r.bufferMutex.Lock()
 				nextT := r.selectDuration(score, r.adaptiveT)
 
-				log.Printf("[PROB-ADAPTIVE: METRICS] Slot: %d | D_i (Queue): %.2f | B_i (Latency): %.2f | C_i (Score): %.2f | DiscQ: %d/%d | CtrlQ: %d/%d | DataQ: %d/%d | KeysLost: %d | QDrops: %d",
+				log.Printf("[PROB-ADAPTIVE: METRICS] Slot: %d | D_i (Queue): %.2f | B_i (Latency): %.2f | C_i (Score): %.2f | IngestQ: %d | DiscQ: %d/%d | CtrlQ: %d/%d | DataQ: %d/%d | KeysLost: %d | QDrops: %d",
 					currentSlot, di, bi, score,
+					backlog,
 					discOcc, cap(r.disclosureMessages),
 					ctrlOcc, cap(r.controlQueue),
 					dataOcc, cap(r.dataQueue),

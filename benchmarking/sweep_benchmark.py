@@ -48,6 +48,7 @@ RE_DROP = re.compile(r"\[SECURITY\] Dropped")
 RE_AUTHED = re.compile(r"Prob-Adaptive Batch Verification: (\d+) messages authenticated")
 RE_BATCH_EMPTY = re.compile(r"\[BATCH-EMPTY\] Prob-Adaptive Batch Verification")
 # Step 1 (F2/F12): pipeline-health outcomes surfaced on the METRICS line.
+RE_INGESTQ = re.compile(r"IngestQ: (\d+)")         # raw ingest backlog (D_i numerator)
 RE_DISCQ = re.compile(r"DiscQ: (\d+)/(\d+)")       # disclosure-queue occupancy / cap
 RE_KEYSLOST = re.compile(r"KeysLost: (\d+)")       # cumulative keys never disclosed
 RE_QDROPS = re.compile(r"QDrops: (\d+)")           # cumulative broadcast-queue drops
@@ -132,10 +133,14 @@ def start_owner() -> subprocess.Popen[str]:
     return proc
 
 
-def get_uuids_from_owner(owner_proc: subprocess.Popen[str], count: int) -> List[str]:
+def get_uuids_from_owner(
+    owner_proc: subprocess.Popen[str], count: int, log_dir: str = SWEEP_DIR
+) -> List[str]:
     print(f"[*] Waiting for {count} UUIDs from Owner (Make sure CM is running!)...")
     uuids: List[str] = []
-    owner_log_file = open(f"{SWEEP_DIR}/owner.log", "w")
+    # log_dir lets a caller (e.g. the sudo-free load sweep) redirect the owner
+    # log to a user-writable directory instead of the root-owned SWEEP_DIR.
+    owner_log_file = open(f"{log_dir}/owner.log", "w")
 
     start_time = time.time()
     # Increased timeout to allow generating 70 UUIDs safely
@@ -202,6 +207,7 @@ def parse_sweep_log(filepath: str) -> Dict:
     drops = 0
     authenticated = 0  # total messages authenticated (sum of N across SUCCESS lines)
     empty_batches = 0  # BF unpacked but matched no buffered messages
+    peak_ingest_q = 0  # peak raw ingest backlog = D_i numerator (Step 3/4 calibration)
     peak_disc_q = 0    # peak disclosure-queue occupancy (Step 1 / F2)
     disc_q_cap = 0     # disclosure-queue capacity (from the log, for the fraction)
     keys_never_disclosed = 0  # cumulative KeysLost (Step 1 / F12)
@@ -236,6 +242,10 @@ def parse_sweep_log(filepath: str) -> Dict:
             if RE_BATCH_EMPTY.search(line):
                 empty_batches += 1
 
+            ingestq_match = RE_INGESTQ.search(line)
+            if ingestq_match:
+                peak_ingest_q = max(peak_ingest_q, int(ingestq_match.group(1)))
+
             discq_match = RE_DISCQ.search(line)
             if discq_match:
                 peak_disc_q = max(peak_disc_q, int(discq_match.group(1)))
@@ -261,6 +271,7 @@ def parse_sweep_log(filepath: str) -> Dict:
         "verified_batches": authenticated,
         "empty_batches": empty_batches,
         # Step 1 (F2/F12): pipeline-overflow outcomes.
+        "peak_ingest_q": peak_ingest_q,
         "peak_disc_q": peak_disc_q,
         "peak_disc_q_frac": (peak_disc_q / disc_q_cap) if disc_q_cap else 0.0,
         "keys_never_disclosed": keys_never_disclosed,
@@ -302,6 +313,7 @@ def main():
                 "security_drops": [],
                 "verified_batches": [],
                 "empty_batches": [],
+                "peak_ingest_q": [],
                 "peak_disc_q": [],
                 "peak_disc_q_frac": [],
                 "keys_never_disclosed": [],
