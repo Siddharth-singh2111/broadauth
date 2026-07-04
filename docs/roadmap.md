@@ -45,6 +45,30 @@ Ours selects the **slot duration** (cadence) on a graded closed loop. They are
 **orthogonal and composable** — ours adds the axis they don't have. Full
 comparison in [Section 4](#4-inf-tesla-comparison-the-papers-central-positioning).
 
+### 1d. Two-layer validation (D_i/B_i injectable *and* emergent)
+D_i and B_i are **measured** signals (they emerge from load + radio), not knobs.
+To use them both as controlled inputs *and* as real observations, the RCD
+supports **optional injection** (`-force-di` / `-force-bi`; `<0` = measure). One
+binary, two modes, one metrics pipeline:
+
+- **Layer 1 — controller characterization (injected, F15-free).** Force D_i/B_i
+  to chosen values and record the *control law's* response: `T_i` trajectory,
+  scaling actions, convergence, and (with step schedules) recovery. Proves the
+  mechanism behaves as designed, in isolation from the radio problem. Produces
+  Figures 1–2. **Note:** physical outcomes (overflow, auth) are synthetic under
+  injection and are NOT recorded here.
+- **Layer 2 — end-to-end (real load, needs F15).** Sweep offered load; record
+  the *emergent* D_i/B_i **and** the physical outcomes (overflow, keys-lost,
+  auth-success), fixed vs adaptive. Produces Figures 3–4.
+- **The bridge.** Layer 2 logs measured D_i/B_i next to outcomes → plot
+  outcomes vs measured D_i/B_i (the "metrics as a function of D_i/B_i" view,
+  with real data). Overlay Layer 1's characterized `T_i = f(D_i,B_i)` on Layer
+  2's actual `(D_i, T_i)` to prove the deployed controller follows its designed
+  law, and use L1 to *explain* L2.
+
+Ordering benefit: **Layer 1 is doable now** (no F15); Layer 2 waits on the
+radio-model (F15/Option-1) decision.
+
 ---
 
 ## 2. Current state (done)
@@ -76,11 +100,14 @@ validated by a `sudo` sweep. ★ = decisive for the paper.
 | # | Step | Files | How to test | Closes |
 |---|---|---|---|---|
 | 0 | **Dead-code cleanup** ✅ done | — | build + test | cleanup |
-| 1 | **Surface outcome metrics** — overflow, keys-never-disclosed, disclosure-queue occupancy, authenticated-count, empty-batches into logs + JSON **[Go]** | `internal/rcd/rcd.go`, parser | 30 s run, grep new lines, check JSON keys | F2, F12 |
-| 2 | **`-traffic-hz` flag** — the load knob (replace hardcoded 100 ms ticker) **[Go]** | `cmd/rcd/main.go`, `internal/rcd/rcd.go` | run 2 rates, confirm ingest cadence | reframe A1 |
-| 3 | **Recalibrate `ingestQueueCap`** for D_i dynamic range (consider `-ingest-cap` flag) **[Go]** | `internal/rcd/rcd.go` | 2-point run, D_i spans 0.1→1.0 not pinned | F4 |
-| 4 | **Load-sweep harness** — X-axis = traffic-hz / ρ, reuse dummynet + kill scaffolding **[Py]** | new `benchmarking/load_sweep.py` | JSON keyed by load | reframe A2 |
-| 5 | ★ **Static-vs-adaptive comparison** — baseline = fixed-T probabilistic at **T_min (fast)** and **T_max (slow)**; adaptive = probadaptive. Produces the Inf-TESLA++ comparison ([Sec 4](#4-inf-tesla-comparison-the-papers-central-positioning)). **[Py]** | harness | multiple series; overflow/auth diverge | **F18** |
+| 1 | **Surface outcome metrics** ✅ done — overflow, keys-lost, queue occupancy, auth-count, empty-batches into logs + JSON **[Go]** | `internal/rcd/rcd.go`, parser | grep new lines, check JSON keys | F2, F12 |
+| 2 | **`-traffic-hz` flag** ✅ done — the load knob **[Go]** | `cmd/rcd/main.go`, `rcd.go` | run 2 rates | reframe A1 |
+| 3 | **`-ingest-cap` flag + D_i jitter fix** ✅ done | `cmd/rcd/main.go`, `rcd.go` | D_i spans range | F4 |
+| 3b | **Injectable D_i/B_i** ✅ done — `-force-di`/`-force-bi` (`<0`=measure) override the signals for Layer-1 characterization | `cmd/rcd/main.go`, `rcd.go` `calculateTimeCongestion` | forced C_i drives T_i | §1d |
+| 4 | **Load-sweep harness** ✅ done — sweeps `-traffic-hz`, no sudo **[Py]** | `benchmarking/load_sweep.py` | JSON keyed by load | reframe A2 |
+| L1 | **Controller characterization (Layer 1)** — inject D_i×B_i grid, record `T_i` response / scaling / convergence. **F15-free.** Figures 1–2. **[Py, no sudo]** | `benchmarking/controller_sweep.py` | steady_T vs (D_i,B_i); toggle fires at C_i>0.75 | §1d |
+| F15 | **Realistic auth-channel (Option 1)** — throttle auth (controlQueue) only, data (dataQueue) unthrottled; `-radio-bps` flag. Unblocks Layer 2. **[Go]** ⏸ *paused, awaiting sign-off* | `udp_broadcast.go`, `rcd.go`, `cmd/rcd/main.go` | auth works below budget, overflows above | F15 |
+| 5 | ★ **Static-vs-adaptive comparison (Layer 2)** — baseline = fixed-T at T_min/T_max; adaptive = probadaptive. Emergent D_i/B_i + overflow/auth. Needs F15. Figures 3–4 + Inf-TESLA++ comparison ([Sec 4](#4-inf-tesla-comparison-the-papers-central-positioning)). **[Py]** | harness | series diverge | **F18** |
 | 5b | *(optional, faithful baseline)* **Implement `C = R/L` mode selector** (empty-slot fraction → deterministic/probabilistic) for an as-published Inf-TESLA++ arm — currently only static `-mode` flags exist **[Go]** | `internal/rcd/rcd.go`, `cmd/rcd/main.go` | run, confirm mode switches on occupancy | faithful comparison |
 | 6 | **Multi-iteration + variance/CIs** (ITERATIONS > 1, mean ± stddev) **[Py]** | harness | JSON has stddev | F21 |
 | 7 | **Transient step-response** — step the load mid-run, plot D_i(t)/T_i(t)/queue(t) **[Py]** | harness + per-slot logs | time-series shows rise→settle | verifies F7 |

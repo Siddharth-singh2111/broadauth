@@ -101,6 +101,8 @@ type RCD struct {
 	messageCounter  uint64
 	trafficInterval time.Duration // Step 2: 1/TrafficHz — the offered-load cadence
 	ingestQueueCap  float64       // Step 3: Q_cap for D_i (from -ingest-cap)
+	forceDi         float64       // Layer-1: injected D_i, or <0 to measure
+	forceBi         float64       // Layer-1: injected B_i, or <0 to measure
 
 	broadcaster broadcast.Broadcaster
 	receiver    broadcast.Receiver
@@ -192,6 +194,13 @@ type Config struct {
 	// the value can be calibrated from load-sweep data. <= 0 falls back to
 	// defaultIngestQueueCap.
 	IngestQueueCap float64
+	// ForceDi / ForceBi inject fixed congestion signals for Layer-1 controller
+	// characterization (Roadmap §Two-layer). A value in [0,1] overrides the
+	// measured D_i / B_i; a negative value (the default) means "measure
+	// normally". This decouples the control law from load/radio dynamics so
+	// its T_i response can be mapped without F15.
+	ForceDi float64
+	ForceBi float64
 }
 
 type Schedule struct {
@@ -263,6 +272,8 @@ func New(cfg Config) (*RCD, error) {
 		simulationTime:     cfg.SimulationTime,
 		trafficInterval:    trafficInterval,
 		ingestQueueCap:     ingestCap,
+		forceDi:            cfg.ForceDi,
+		forceBi:            cfg.ForceBi,
 		broadcaster:        broadcaster,
 		receiver:           receiver,
 		slotSource:         slotSource,
@@ -1304,6 +1315,17 @@ func (r *RCD) calculateTimeCongestion(backlog int) (di float64, bi float64, scor
 	bi = r.broadcastLatencyEWMAms() / latencyBaselineMs
 	if bi > 1.0 {
 		bi = 1.0
+	}
+
+	// Layer-1 characterization: override the measured signals with injected
+	// constants when requested (a value in [0,1]); a negative value means
+	// "measure normally". Lets the controller's T_i response be mapped as a
+	// function of (D_i, B_i) independent of load/radio dynamics.
+	if r.forceDi >= 0 {
+		di = r.forceDi
+	}
+	if r.forceBi >= 0 {
+		bi = r.forceBi
 	}
 
 	score = wDisc*di + wLat*bi

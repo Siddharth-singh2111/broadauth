@@ -27,6 +27,8 @@ func main() {
 	tMax := flag.Uint64("t-max", 10000, "Maximum slot duration in ms (Adaptive Mode)")
 	trafficHz := flag.Float64("traffic-hz", 10.0, "Application traffic generation rate in messages/sec (offered-load knob)")
 	ingestCap := flag.Float64("ingest-cap", 10.0, "Ingest-queue capacity Q_cap for D_i normalization (congestion controller)")
+	forceDi := flag.Float64("force-di", -1.0, "Inject a fixed D_i in [0,1] for controller characterization; <0 = measure normally")
+	forceBi := flag.Float64("force-bi", -1.0, "Inject a fixed B_i in [0,1] for controller characterization; <0 = measure normally")
 
 	flag.Parse()
 
@@ -72,6 +74,8 @@ func main() {
 		TMax:               *tMax,
 		TrafficHz:          *trafficHz,
 		IngestQueueCap:     *ingestCap,
+		ForceDi:            *forceDi,
+		ForceBi:            *forceBi,
 	}
 
 	r, err := rcd.New(cfg)
