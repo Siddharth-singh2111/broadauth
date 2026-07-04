@@ -513,11 +513,28 @@ func (r *RCD) slotLoop() {
 				// logged metrics are exactly what the controller acts on.
 				di, bi, score := r.calculateTimeCongestion()
 
+				// F2/F12: surface the pipeline-health outcomes the paper's
+				// failure mode is about. Occupancy of the three bounded queues,
+				// plus the cumulative counts of keys that were never disclosed
+				// (disclosure queue full) and broadcast jobs dropped (radio
+				// queue full). These are the "overflow" the paper claims the
+				// adaptive controller prevents; they were counted but not
+				// visible. Channel len()/cap() reads are concurrency-safe.
+				discOcc := len(r.disclosureMessages)
+				ctrlOcc := len(r.controlQueue)
+				dataOcc := len(r.dataQueue)
+				keysLost := atomic.LoadUint64(&r.metrics.DisclosureDrops)
+				qDrops := atomic.LoadUint64(&r.metrics.BroadcastQueueDrops)
+
 				r.bufferMutex.Lock()
 				nextT := r.selectDuration(score, r.adaptiveT)
 
-				log.Printf("[PROB-ADAPTIVE: METRICS] Slot: %d | D_i (Queue): %.2f | B_i (Latency): %.2f | C_i (Score): %.2f",
-					currentSlot, di, bi, score)
+				log.Printf("[PROB-ADAPTIVE: METRICS] Slot: %d | D_i (Queue): %.2f | B_i (Latency): %.2f | C_i (Score): %.2f | DiscQ: %d/%d | CtrlQ: %d/%d | DataQ: %d/%d | KeysLost: %d | QDrops: %d",
+					currentSlot, di, bi, score,
+					discOcc, cap(r.disclosureMessages),
+					ctrlOcc, cap(r.controlQueue),
+					dataOcc, cap(r.dataQueue),
+					keysLost, qDrops)
 
 				if nextT != r.adaptiveT {
 					log.Printf("[PROB-ADAPTIVE: TOGGLE-ACTION] Threshold breached! Slot %d | Scaling T_i: %dms -> %dms",

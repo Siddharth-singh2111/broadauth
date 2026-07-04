@@ -47,6 +47,10 @@ RE_DROP = re.compile(r"\[SECURITY\] Dropped")
 # only when N > 0 and BATCH-EMPTY otherwise; we count both separately.
 RE_AUTHED = re.compile(r"Prob-Adaptive Batch Verification: (\d+) messages authenticated")
 RE_BATCH_EMPTY = re.compile(r"\[BATCH-EMPTY\] Prob-Adaptive Batch Verification")
+# Step 1 (F2/F12): pipeline-health outcomes surfaced on the METRICS line.
+RE_DISCQ = re.compile(r"DiscQ: (\d+)/(\d+)")       # disclosure-queue occupancy / cap
+RE_KEYSLOST = re.compile(r"KeysLost: (\d+)")       # cumulative keys never disclosed
+RE_QDROPS = re.compile(r"QDrops: (\d+)")           # cumulative broadcast-queue drops
 
 # --- macOS network shaping (dnctl + pfctl / dummynet) ---
 # Linux's tc/netem doesn't exist on Darwin. The broadcast-auth data plane is
@@ -198,6 +202,10 @@ def parse_sweep_log(filepath: str) -> Dict:
     drops = 0
     authenticated = 0  # total messages authenticated (sum of N across SUCCESS lines)
     empty_batches = 0  # BF unpacked but matched no buffered messages
+    peak_disc_q = 0    # peak disclosure-queue occupancy (Step 1 / F2)
+    disc_q_cap = 0     # disclosure-queue capacity (from the log, for the fraction)
+    keys_never_disclosed = 0  # cumulative KeysLost (Step 1 / F12)
+    broadcast_queue_drops = 0  # cumulative QDrops (Step 1 / F12)
 
     with open(filepath, "r") as f:
         for line in f:
@@ -228,6 +236,20 @@ def parse_sweep_log(filepath: str) -> Dict:
             if RE_BATCH_EMPTY.search(line):
                 empty_batches += 1
 
+            discq_match = RE_DISCQ.search(line)
+            if discq_match:
+                peak_disc_q = max(peak_disc_q, int(discq_match.group(1)))
+                disc_q_cap = int(discq_match.group(2))
+
+            keyslost_match = RE_KEYSLOST.search(line)
+            if keyslost_match:
+                # cumulative in the log → max is the final total
+                keys_never_disclosed = max(keys_never_disclosed, int(keyslost_match.group(1)))
+
+            qdrops_match = RE_QDROPS.search(line)
+            if qdrops_match:
+                broadcast_queue_drops = max(broadcast_queue_drops, int(qdrops_match.group(1)))
+
     return {
         "avg_t_ms": sum(t_history) / len(t_history) if t_history else 1000,
         "peak_di": max(di_history) if di_history else 0.0,
@@ -238,6 +260,11 @@ def parse_sweep_log(filepath: str) -> Dict:
         # authenticated messages now (Fix 1), not unpack events.
         "verified_batches": authenticated,
         "empty_batches": empty_batches,
+        # Step 1 (F2/F12): pipeline-overflow outcomes.
+        "peak_disc_q": peak_disc_q,
+        "peak_disc_q_frac": (peak_disc_q / disc_q_cap) if disc_q_cap else 0.0,
+        "keys_never_disclosed": keys_never_disclosed,
+        "broadcast_queue_drops": broadcast_queue_drops,
     }
 
 
@@ -275,6 +302,10 @@ def main():
                 "security_drops": [],
                 "verified_batches": [],
                 "empty_batches": [],
+                "peak_disc_q": [],
+                "peak_disc_q_frac": [],
+                "keys_never_disclosed": [],
+                "broadcast_queue_drops": [],
             }
 
             for run in range(ITERATIONS):
@@ -369,6 +400,16 @@ def main():
             )
             print(
                 f"  -> Avg Late-Arrival Drops:      {averaged_metrics['security_drops']:.1f}"
+            )
+            print(
+                f"  -> Avg Peak Disclosure-Q:       {averaged_metrics['peak_disc_q']:.1f}"
+                f" ({averaged_metrics['peak_disc_q_frac'] * 100:.0f}% of cap)"
+            )
+            print(
+                f"  -> Avg Keys Never Disclosed:    {averaged_metrics['keys_never_disclosed']:.1f}"
+            )
+            print(
+                f"  -> Avg Broadcast-Queue Drops:   {averaged_metrics['broadcast_queue_drops']:.1f}"
             )
 
         reset_network()

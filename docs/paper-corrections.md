@@ -15,6 +15,7 @@ manuscript source.
 | F4 | `Q_cap` is a named constant; fixed the `//100` comment | `rcd.go` `ingestQueueCap` | ✅ done |
 | F6 | EWMA latency so `B_i` can recover | `rcd.go` `observeBroadcastLatency` | ✅ done |
 | F12 | Disclosure-queue overflow counter + `[DISCLOSURE-OVERFLOW]` log | `rcd.go` `Metrics.DisclosureDrops` | ✅ done |
+| Roadmap Step 1 | Surface pipeline-health outcomes on the METRICS line + in the JSON: disclosure/control/data queue occupancy, `KeysLost` (keys never disclosed), `QDrops` (broadcast-queue drops). Parser adds `peak_disc_q`, `peak_disc_q_frac`, `keys_never_disclosed`, `broadcast_queue_drops`. Additive — existing `D_i`/`B_i`/`C_i` regexes unaffected. (Closes F2 instrumentation + F12 surfacing.) | `rcd.go` `slotLoop`, `sweep_benchmark.py` parser | ✅ done (branch `roadmap-impl`) |
 | F8 | Split traffic generation and slot control into independent goroutines | `rcd.go` `trafficLoop`/`slotLoop` | ✅ done |
 | F8.5 | Fix double slot-counter advance: `AdaptiveSlotSource.Ticker()` was called twice, so slot advanced at 2×T_i rate (halving effective disclosure delay). `disclosureWorker` now polls `GetSlot()`. | `rcd.go` `disclosureWorker` | ✅ done |
 | Fix 1 | Honest verification logging: `[SUCCESS]` only when N>0, `[BATCH-EMPTY]` otherwise. Python parser sums actual N from `N messages authenticated`, separate `empty_batches` counter. Previously every empty BF unpack counted as a "verified batch" — masking that 0 messages had ever actually been authenticated. | `rcd.go`, `sweep_benchmark.py` | ✅ done |
