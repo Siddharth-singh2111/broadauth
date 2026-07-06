@@ -6,15 +6,19 @@ import (
 	"net"
 	"sync"
 	"time"
-
-	"golang.org/x/time/rate" // Added for Hardware Emulation
 )
+
+// defaultRadioBytesPerSec is the auth-channel budget (F15/Option-1). The
+// throttled path models a constrained RCD radio carrying only the protocol's
+// auth overhead (HMAC/BF/key); application data uses the unthrottled path.
+const defaultRadioBytesPerSec = 250
 
 // UDPConfig holds configuration for UDP broadcasting
 type UDPConfig struct {
-	BroadcastAddr string // Address to broadcast to (e.g., "255.255.255.255:8888")
-	ListenAddr    string // Address to listen on (e.g., ":8888")
-	BufferSize    int    // Size of the receive buffer
+	BroadcastAddr    string // Address to broadcast to (e.g., "255.255.255.255:8888")
+	ListenAddr       string // Address to listen on (e.g., ":8888")
+	BufferSize       int    // Size of the receive buffer
+	RadioBytesPerSec int    // Throttled auth-channel rate; <=0 -> default
 }
 
 // DefaultUDPConfig returns a configuration with sensible defaults
@@ -24,16 +28,17 @@ func DefaultUDPConfig() UDPConfig {
 		ListenAddr:    ":8888",
 		// BufferSize:    1024,
 		// Reduced to mimic ESP32 type devices
-		BufferSize: 4096,
+		BufferSize:       4096,
+		RadioBytesPerSec: defaultRadioBytesPerSec,
 	}
 }
 
 // UDPBroadcaster implements the Broadcaster interface using UDP
 type UDPBroadcaster struct {
-	conn    *net.UDPConn
-	addr    *net.UDPAddr
-	mu      sync.Mutex
-	limiter *rate.Limiter // Added to enforce physical baud rate constraints
+	conn             *net.UDPConn
+	addr             *net.UDPAddr
+	mu               sync.Mutex
+	radioBytesPerSec int // auth-channel throttle rate (bytes/sec)
 }
 
 // NewUDPBroadcaster creates a new UDP broadcaster
@@ -55,36 +60,48 @@ func NewUDPBroadcaster(config UDPConfig) (*UDPBroadcaster, error) {
 		return nil, err
 	}
 
-	// -------------------------------------------------------------
-	// HARDWARE EMULATION:
-	// Simulate an ESP32/Zigbee radio strictly limited to ~1.6 kbps (200 bytes/sec).
-	// This acts as a physical hardware bottleneck.
-	// -------------------------------------------------------------
-	bytesPerSecond := 100
-	limiter := rate.NewLimiter(rate.Limit(bytesPerSecond), 8192)
+	rate := config.RadioBytesPerSec
+	if rate <= 0 {
+		rate = defaultRadioBytesPerSec
+	}
 	return &UDPBroadcaster{
-		conn:    conn,
-		addr:    addr,
-		limiter: limiter,
+		conn:             conn,
+		addr:             addr,
+		radioBytesPerSec: rate,
 	}, nil
 }
 
-// Broadcast implements the Broadcaster interface
+// Broadcast implements the throttled (auth-channel) path. It sleeps for the
+// modelled transmission time at the configured radio rate, then sends — this
+// is the constrained budget the disclosure pipeline competes for (F15).
 func (b *UDPBroadcaster) Broadcast(ctx context.Context, data []byte) error {
-	// Check if context is canceled
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	default:
-		// Continue with broadcasting
 	}
 
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	baudRateBytesPerSec := 50
-	transmissionTime := time.Duration(len(data)) * time.Second / time.Duration(baudRateBytesPerSec)
+	transmissionTime := time.Duration(len(data)) * time.Second / time.Duration(b.radioBytesPerSec)
 	time.Sleep(transmissionTime)
+
+	_, err := b.conn.Write(data)
+	return err
+}
+
+// BroadcastUnthrottled implements the application data plane: no rate limit.
+// Data is baseline traffic, not charged against the auth budget (F15/Option-1).
+func (b *UDPBroadcaster) BroadcastUnthrottled(ctx context.Context, data []byte) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
 
 	_, err := b.conn.Write(data)
 	return err

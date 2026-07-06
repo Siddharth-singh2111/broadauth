@@ -29,6 +29,7 @@ func main() {
 	ingestCap := flag.Float64("ingest-cap", 10.0, "Ingest-queue capacity Q_cap for D_i normalization (congestion controller)")
 	forceDi := flag.Float64("force-di", -1.0, "Inject a fixed D_i in [0,1] for controller characterization; <0 = measure normally")
 	forceBi := flag.Float64("force-bi", -1.0, "Inject a fixed B_i in [0,1] for controller characterization; <0 = measure normally")
+	radioBps := flag.Int("radio-bps", 250, "Throttled auth-channel budget in bytes/sec (F15); application data is unthrottled")
 
 	flag.Parse()
 
@@ -76,6 +77,7 @@ func main() {
 		IngestQueueCap:     *ingestCap,
 		ForceDi:            *forceDi,
 		ForceBi:            *forceBi,
+		RadioBps:           *radioBps,
 	}
 
 	r, err := rcd.New(cfg)

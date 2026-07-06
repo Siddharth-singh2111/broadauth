@@ -70,12 +70,12 @@ const (
 
 // Metrics holds atomic counters for benchmarking
 type Metrics struct {
-	BytesSent        uint64
-	BytesReceived    uint64
-	MessagesSent     uint64
-	MessagesReceived uint64
-	OverheadBytes    uint64 // Bytes used for HMACs, Keys, BloomFilters (non-payload)
-	DisclosureDrops  uint64 // F12: disclosure-queue overflow events (keys never disclosed)
+	BytesSent           uint64
+	BytesReceived       uint64
+	MessagesSent        uint64
+	MessagesReceived    uint64
+	OverheadBytes       uint64 // Bytes used for HMACs, Keys, BloomFilters (non-payload)
+	DisclosureDrops     uint64 // F12: disclosure-queue overflow events (keys never disclosed)
 	BroadcastQueueDrops uint64 // Bug-C fix: broadcast worker queue full → message dropped
 
 	// Timing Metrics (Cumulative Nanoseconds)
@@ -201,6 +201,10 @@ type Config struct {
 	// its T_i response can be mapped without F15.
 	ForceDi float64
 	ForceBi float64
+	// RadioBps is the throttled auth-channel budget in bytes/sec (F15/Option-1):
+	// only auth traffic (HMAC/BF/key) is charged against it; application data is
+	// unthrottled. <=0 falls back to the broadcaster default.
+	RadioBps int
 }
 
 type Schedule struct {
@@ -222,7 +226,12 @@ func New(cfg Config) (*RCD, error) {
 		return nil, fmt.Errorf("failed to instantiate contract: %v", err)
 	}
 
-	broadcaster, err := broadcast.NewUDPBroadcaster(broadcast.DefaultUDPConfig())
+	// F15/Option-1: set the throttled auth-channel budget from the flag.
+	bcastCfg := broadcast.DefaultUDPConfig()
+	if cfg.RadioBps > 0 {
+		bcastCfg.RadioBytesPerSec = cfg.RadioBps
+	}
+	broadcaster, err := broadcast.NewUDPBroadcaster(bcastCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create broadcaster: %v", err)
 	}
@@ -282,8 +291,8 @@ func New(cfg Config) (*RCD, error) {
 		// per slot — generous capacity so nothing important is ever dropped).
 		// dataQueue holds the high-rate trafficLoop output; capacity is large
 		// but bounded, so under sustained overload trafficLoop drops cleanly.
-		controlQueue: make(chan broadcastJob, 1024),
-		dataQueue:    make(chan broadcastJob, 4096),
+		controlQueue:       make(chan broadcastJob, 1024),
+		dataQueue:          make(chan broadcastJob, 4096),
 		messageBuffer:      make([][]byte, 0),
 		mode:               cfg.Mode,
 		tMin:               cfg.TMin,
@@ -1399,31 +1408,34 @@ func (r *RCD) broadcastWorker() {
 	defer r.wg.Done()
 	for {
 		// 1) Prefer control traffic: drain anything immediately available.
+		//    Control = auth (HMAC/BF/key) → throttled auth channel.
 		select {
 		case <-r.ctx.Done():
 			return
 		case job := <-r.controlQueue:
-			r.transmit(job)
+			r.transmit(job, true)
 			continue
 		default:
 		}
 
 		// 2) Otherwise wait on either lane (control still preferred on tie
-		//    by step 1 next iteration).
+		//    by step 1 next iteration). Data → unthrottled application plane.
 		select {
 		case <-r.ctx.Done():
 			return
 		case job := <-r.controlQueue:
-			r.transmit(job)
+			r.transmit(job, true)
 		case job := <-r.dataQueue:
-			r.transmit(job)
+			r.transmit(job, false)
 		}
 	}
 }
 
-// transmit performs the actual broadcaster.Broadcast call and updates metrics.
+// transmit performs the actual broadcast and updates metrics. throttled routes
+// auth traffic (control lane) through the rate-limited radio budget, while
+// application data (data lane) uses the unthrottled plane (F15/Option-1).
 // Factored out so broadcastWorker's queue-priority logic stays readable.
-func (r *RCD) transmit(job broadcastJob) {
+func (r *RCD) transmit(job broadcastJob, throttled bool) {
 	data := job.preBuilt
 	if data == nil {
 		assembled, ok := r.buildAdaptiveDataAtSendTime(job)
@@ -1434,9 +1446,19 @@ func (r *RCD) transmit(job broadcastJob) {
 	}
 
 	start := time.Now()
-	err := r.broadcaster.Broadcast(r.ctx, data)
+	var err error
+	if throttled {
+		err = r.broadcaster.Broadcast(r.ctx, data)
+	} else {
+		err = r.broadcaster.BroadcastUnthrottled(r.ctx, data)
+	}
 	elapsed := time.Since(start)
-	r.observeBroadcastLatency(elapsed)
+	// Only the throttled auth channel feeds B_i — that's the radio pressure the
+	// controller reacts to; unthrottled data sends are ~instant and would
+	// wrongly deflate the latency signal.
+	if throttled {
+		r.observeBroadcastLatency(elapsed)
+	}
 	if r.enableBenchmarking {
 		atomic.AddInt64(&r.metrics.BroadcastDuration, elapsed.Nanoseconds())
 		atomic.AddInt64(&r.metrics.BroadcastCount, 1)
