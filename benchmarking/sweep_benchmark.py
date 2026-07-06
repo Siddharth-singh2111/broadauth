@@ -38,6 +38,7 @@ RCD_STARTUP_WAIT = 15
 RE_DI = re.compile(r"D_i \(Queue\): ([\d\.]+)")
 RE_BI = re.compile(r"B_i \(Latency\): ([\d\.]+)")
 RE_TOGGLE = re.compile(r"Scaling T_i: \d+ms -> (\d+)ms")
+RE_TI = re.compile(r"\| T_i: (\d+)ms")  # actual per-slot T_i on the METRICS line
 RE_BATCH = re.compile(r"Batch of (\d+) packets")
 RE_DROP = re.compile(r"\[SECURITY\] Dropped")
 # Fix 1: count actual authenticated messages (the N in "N messages
@@ -215,6 +216,12 @@ def parse_sweep_log(filepath: str) -> Dict:
 
     with open(filepath, "r") as f:
         for line in f:
+            # Prefer the actual T_i logged on the METRICS line (robust for
+            # no-toggle fixed arms); fall back to toggle reconstruction.
+            ti_match = RE_TI.search(line)
+            if ti_match:
+                current_t = int(ti_match.group(1))
+
             di_match = RE_DI.search(line)
             if di_match:
                 di_history.append(float(di_match.group(1)))
